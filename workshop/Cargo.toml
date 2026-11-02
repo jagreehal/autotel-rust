@@ -1,0 +1,162 @@
+[package]
+name = "workshop"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Rust OpenTelemetry Workshop: from println! to one trace across three services"
+
+# Every part is its own binary, so an exercise you are halfway through editing
+# never stops another part from compiling. `cargo ex 05` and `cargo sol 05`
+# (aliases in ../.cargo/config.toml) pick the right one.
+
+[lib]
+name = "bank"
+path = "bank/mod.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+autotel = { path = ".." }
+axum = "0.8.9"
+futures = "0.3.34"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "json", "registry"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[[bin]]
+name = "ex01"
+path = "01-the-console-log-wall/exercise.rs"
+
+[[bin]]
+name = "sol01"
+path = "01-the-console-log-wall/solution.rs"
+
+[[bin]]
+name = "ex02"
+path = "02-your-first-span/exercise.rs"
+
+[[bin]]
+name = "sol02"
+path = "02-your-first-span/solution.rs"
+
+[[bin]]
+name = "ex03"
+path = "03-attributes-not-messages/exercise.rs"
+
+[[bin]]
+name = "sol03"
+path = "03-attributes-not-messages/solution.rs"
+
+[[bin]]
+name = "ex04"
+path = "04-which-work-deserves-a-span/exercise.rs"
+
+[[bin]]
+name = "sol04"
+path = "04-which-work-deserves-a-span/solution.rs"
+
+[[bin]]
+name = "ex05"
+path = "05-one-wide-event/exercise.rs"
+
+[[bin]]
+name = "sol05"
+path = "05-one-wide-event/solution.rs"
+
+[[bin]]
+name = "ex06"
+path = "06-logs-you-already-have/exercise.rs"
+
+[[bin]]
+name = "sol06"
+path = "06-logs-you-already-have/solution.rs"
+
+[[bin]]
+name = "ex07"
+path = "07-errors-that-explain-themselves/exercise.rs"
+
+[[bin]]
+name = "sol07"
+path = "07-errors-that-explain-themselves/solution.rs"
+
+[[bin]]
+name = "ex08"
+path = "08-events-the-business-asks-for/exercise.rs"
+
+[[bin]]
+name = "sol08"
+path = "08-events-the-business-asks-for/solution.rs"
+
+[[bin]]
+name = "ex09"
+path = "09-the-dashboard/exercise.rs"
+
+[[bin]]
+name = "sol09"
+path = "09-the-dashboard/solution.rs"
+
+[[bin]]
+name = "ex10"
+path = "10-finding-the-cause/exercise.rs"
+
+[[bin]]
+name = "sol10"
+path = "10-finding-the-cause/solution.rs"
+
+[[bin]]
+name = "ex11"
+path = "11-one-trace-three-services/exercise.rs"
+
+[[bin]]
+name = "sol11"
+path = "11-one-trace-three-services/solution.rs"
+
+[[bin]]
+name = "ex12"
+path = "12-facts-that-travel/exercise.rs"
+
+[[bin]]
+name = "sol12"
+path = "12-facts-that-travel/solution.rs"
+
+[[bin]]
+name = "ex13"
+path = "13-a-cause-in-three-parts/exercise.rs"
+
+[[bin]]
+name = "sol13"
+path = "13-a-cause-in-three-parts/solution.rs"
+
+[[bin]]
+name = "p11-auth"
+path = "11-one-trace-three-services/services/auth.rs"
+
+[[bin]]
+name = "p11-accounts"
+path = "11-one-trace-three-services/services/accounts.rs"
+
+[[bin]]
+name = "p11-auth-propagated"
+path = "11-one-trace-three-services/services-propagated/auth.rs"
+
+[[bin]]
+name = "p11-accounts-propagated"
+path = "11-one-trace-three-services/services-propagated/accounts.rs"
+
+[[bin]]
+name = "run"
+path = "tools/run.rs"
+
+[[bin]]
+name = "check"
+path = "tools/check.rs"
