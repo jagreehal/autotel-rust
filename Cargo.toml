@@ -1,0 +1,73 @@
+[package]
+name = "autotel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Jag Reehal"]
+description = "Write Once, Observe Everywhere: ergonomic OpenTelemetry for Rust"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jagreehal/autotel-rust"
+homepage = "https://github.com/jagreehal/autotel-rust"
+documentation = "https://docs.rs/autotel"
+keywords = ["opentelemetry", "observability", "tracing", "telemetry"]
+categories = ["development-tools::debugging"]
+# Ship the library only: CI config, the workshop, reports and test fixtures stay in git.
+include = ["/src/**/*.rs", "/tests/**/*.rs", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[workspace]
+members = [".", "workshop"]
+
+[features]
+default = []
+## Axum middleware that extracts W3C context and starts a SERVER HTTP span.
+axum = ["dep:axum", "dep:tower"]
+## Export traces/metrics/logs over OTLP/gRPC (tonic) instead of OTLP/HTTP JSON.
+grpc = ["opentelemetry-otlp/grpc-tonic"]
+## SQLx transaction helper and pool metrics (Postgres + SQLite).
+sqlx = ["dep:sqlx"]
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", optional = true }
+tower = { version = "0.5.3", optional = true, default-features = false }
+http = "1.5.0"
+opentelemetry = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
+opentelemetry-appender-tracing = "0.33.1"
+opentelemetry-http = "0.33.1"
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-json", "logs", "metrics", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["logs", "metrics", "rt-tokio", "trace"] }
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sqlx = { version = "0.8.6", optional = true, default-features = false, features = ["runtime-tokio", "postgres", "sqlite"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt"] }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry", "std"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["full"] }
+executable-stories = "0.2.0"
+opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
+dtor = "1.0.6"
+serde_json = "1.0.154"
+tower = "0.5.3"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Error-handling lints from the restriction group: no silently dropped errors.
+let_underscore_must_use = "deny"
+map_err_ignore = "deny"
