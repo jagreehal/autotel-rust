@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -57,7 +57,7 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.88.0"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p autotel --lib --all-features
       - run: cargo check -p autotel --lib --no-default-features
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # Release build; fails if span throughput stops scaling with tasks (a global lock).
       - run: cargo test --release -p autotel --test throughput -- --ignored --nocapture
