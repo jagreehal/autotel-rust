@@ -348,6 +348,14 @@ mod scrub_tests {
     }
 
     #[test]
+    fn scrub_text_stays_linear_on_long_values() {
+        let input = "token=x:".repeat(50_000);
+        let started = std::time::Instant::now();
+        assert_eq!(scrub_text(&input).as_deref(), Some("token=[REDACTED]"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
     fn token_counts_are_not_secrets() {
         assert!(pii_key("api_token"));
         assert!(pii_key("user.email"));

@@ -645,11 +645,14 @@ pub fn shutdown() {
 /// `shutdown` runs from `Drop`, so it can't return an error; say so instead of
 /// losing the last batch silently.
 fn report_shutdown(signal: &str, result: opentelemetry_sdk::error::OTelSdkResult) {
-    if let Err(error) = result {
-        eprintln!(
-            "[autotel] {signal} did not shut down cleanly; the last batch may be lost ({error})"
-        );
-    }
+    use opentelemetry_sdk::error::OTelSdkError;
+    // Exporter error text can quote the endpoint URL and its credentials: print the kind only.
+    let kind = match result {
+        Ok(()) | Err(OTelSdkError::AlreadyShutdown) => return,
+        Err(OTelSdkError::Timeout(_)) => "timed out",
+        Err(_) => "export failed",
+    };
+    eprintln!("[autotel] {signal} did not shut down cleanly ({kind}); the last batch may be lost");
 }
 
 fn build_span_exporter(
@@ -1120,7 +1123,12 @@ pub(crate) fn scrub_text(text: &str) -> Option<String> {
             .position(|b| b.is_ascii_whitespace() || b",;&\"'".contains(b))
             .map_or(bytes.len(), |n| from + n)
     };
+    let mut covered = 0;
     for (sep, _) in text.match_indices(['=', ':']) {
+        // Inside a value already redacted: keeps the scan linear.
+        if sep < covered {
+            continue;
+        }
         // `"password": "x"` (JSON): step over the key's closing quote.
         let mut key_end = bytes[..sep]
             .iter()
@@ -1151,6 +1159,7 @@ pub(crate) fn scrub_text(text: &str) -> Option<String> {
             }
             _ => value_end(start),
         };
+        covered = end;
         if end > start {
             hits.push((start, end));
         }
