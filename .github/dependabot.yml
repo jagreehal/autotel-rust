@@ -8,3 +8,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The tag is the Rust version (dev toolchain and MSRV), pinned on purpose.
+      - dependency-name: dtolnay/rust-toolchain
