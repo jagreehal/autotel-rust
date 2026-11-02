@@ -1,0 +1,6 @@
+[alias]
+# `cargo ex 04` runs the exercise in workshop/04-*, `cargo sol 04` our solution.
+ex = "run -q -p workshop --bin run -- exercise"
+sol = "run -q -p workshop --bin run -- solution"
+# Runs every part into a private devtools and checks each emits what it claims.
+workshop-check = "run -q -p workshop --bin check"
