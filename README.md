@@ -285,7 +285,7 @@ Use `.json_logs()` in place of `.with_tracing_subscriber()` to print JSON lines 
 
 ## Also included
 
-- `TraceCollector` for asserting on spans in tests, and an embedded devtools receiver for local runs.
+- `TraceCollector` for asserting on spans in tests, safe under `cargo test`'s parallel threads, and an embedded devtools receiver for local runs.
 - GenAI spans and metrics (`gen_ai`, `GenAiMetrics`) following the OpenTelemetry GenAI conventions.
 - Business events with subscribers (`track`, `FileSubscriber`).
 - Cohort comparison, SLO trackers, burn-rate alerts and forecasting over recorded spans.

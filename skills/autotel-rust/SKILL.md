@@ -100,4 +100,4 @@ let span = collector.expect_span("order.create");
 assert_eq!(span.attributes["order.id"], serde_json::json!("ord_42"));
 ```
 
-`TraceCollector` turns on span capture. Production configs leave `capture_spans` off.
+`TraceCollector` turns on span capture. Production configs leave `capture_spans` off. Tests that use one run one at a time, so they need no lock of their own. Keep to one per test: a second on the same thread returns an error.

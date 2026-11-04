@@ -9,10 +9,10 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
+    thread::{self, ThreadId},
     time::{Duration, Instant},
 };
 
@@ -37,13 +37,59 @@ pub fn flatten_metadata(metadata: &Attributes) -> Attributes {
     output
 }
 
+/// The thread whose collector is open. `init` clears the span buffer and dropping a
+/// collector shuts the SDK down, so two open at once would break each other.
+static COLLECTOR_TURN: Mutex<Option<ThreadId>> = Mutex::new(None);
+static COLLECTOR_TURN_ENDED: Condvar = Condvar::new();
+
+fn collector_turn() -> MutexGuard<'static, Option<ThreadId>> {
+    COLLECTOR_TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A held turn. It stores no guard, so [`TraceCollector`] stays `Send`.
+struct CollectorTurn;
+
+impl CollectorTurn {
+    fn take() -> anyhow::Result<Self> {
+        let current = thread::current().id();
+        let mut holder = collector_turn();
+        while let Some(thread) = *holder {
+            anyhow::ensure!(
+                thread != current,
+                "a TraceCollector is already open on this thread"
+            );
+            holder = COLLECTOR_TURN_ENDED
+                .wait(holder)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *holder = Some(current);
+        Ok(Self)
+    }
+}
+
+impl Drop for CollectorTurn {
+    fn drop(&mut self) {
+        *collector_turn() = None;
+        COLLECTOR_TURN_ENDED.notify_one();
+    }
+}
+
+/// Records spans for assertions in tests.
+///
+/// One collector is open at a time per process. [`TraceCollector::new`] waits for the
+/// open one to drop, so tests that use a collector run one after another, and each
+/// sees only its own spans. Opening a second on the same thread returns an error.
 pub struct TraceCollector {
     _runtime: crate::AutotelRuntime,
+    // Declared last: the turn ends after the runtime has shut down.
+    _turn: CollectorTurn,
 }
 impl TraceCollector {
     pub fn new(service: &str) -> anyhow::Result<Self> {
+        let turn = CollectorTurn::take()?;
         Ok(Self {
             _runtime: crate::init(crate::AutotelConfig::new(service).capture_spans())?,
+            _turn: turn,
         })
     }
     pub fn spans(&self) -> Vec<SpanData> {
