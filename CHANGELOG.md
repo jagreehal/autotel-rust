@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `TraceCollector` works in parallel tests. `new` waits for the open collector to drop, so each test sees only its own spans.
+
 ## 0.2.0
 
 - `autotel::tonic::layer()` (`tonic` feature) records gRPC SERVER spans and `rpc.server.call.duration` with the stable RPC conventions.
