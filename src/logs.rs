@@ -1,3 +1,4 @@
+use crate::core::env_value;
 use opentelemetry::{
     Context, InstrumentationScope,
     logs::{AnyValue, LogRecord, Logger, LoggerProvider},
@@ -19,6 +20,9 @@ use tracing::{
     Event, Subscriber,
     field::{Field, Visit},
 };
+pub use tracing_appender::rolling::Rotation as LogRotation;
+use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::{
     Layer,
     filter::filter_fn,
@@ -80,6 +84,10 @@ impl LogProcessor for StampTimestamp {
     }
 
     fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
         Ok(())
     }
 }
@@ -158,6 +166,134 @@ impl LogProcessor for RedactPii {
     fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
+
+    fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+        Ok(())
+    }
+}
+
+/// Rolling log files, for [`crate::AutotelConfig::log_file`].
+///
+/// ```
+/// use autotel::{LogFile, LogRotation};
+/// let file = LogFile::new("logs").prefix("orders").rotation(LogRotation::HOURLY).max_files(24);
+/// ```
+#[derive(Clone, Debug)]
+pub struct LogFile {
+    dir: std::path::PathBuf,
+    prefix: Option<String>,
+    suffix: String,
+    rotation: LogRotation,
+    max_files: usize,
+    blocking: bool,
+}
+
+impl LogFile {
+    /// Daily files in `dir`, created if missing, keeping the last 7.
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            prefix: None,
+            suffix: "log".into(),
+            rotation: LogRotation::DAILY,
+            max_files: 7,
+            blocking: false,
+        }
+    }
+
+    /// Filename prefix. Defaults to the service name. Pruning matches on it, so give
+    /// each service its own directory or a prefix no other service's starts with.
+    #[must_use]
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Filename suffix. Defaults to `log`.
+    #[must_use]
+    pub fn suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.suffix = suffix.into();
+        self
+    }
+
+    #[must_use]
+    pub fn rotation(mut self, rotation: LogRotation) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// How many files to keep before deleting the oldest: 2 or more, or 0 to keep them all.
+    #[must_use]
+    pub fn max_files(mut self, max_files: usize) -> Self {
+        self.max_files = max_files;
+        self
+    }
+
+    /// Write on the logging thread. By default a background thread writes, which keeps
+    /// disk latency out of requests but drops lines if the disk can't keep up.
+    #[must_use]
+    pub fn blocking(mut self) -> Self {
+        self.blocking = true;
+        self
+    }
+}
+
+/// `AUTOTEL_LOG_FILE_DIR` turns file logging on without code changes, and
+/// `_ROTATION` and `_MAX_FILES` tune it. They win over `configured`, and bad values
+/// fail `init`.
+pub(crate) fn resolve_log_file(
+    configured: Option<LogFile>,
+    service: &str,
+) -> anyhow::Result<Option<(BoxMakeWriter, Option<WorkerGuard>)>> {
+    let file = match (configured, env_value("AUTOTEL_LOG_FILE_DIR")) {
+        (Some(file), Some(dir)) => Some(LogFile {
+            dir: dir.into(),
+            ..file
+        }),
+        (None, Some(dir)) => Some(LogFile::new(dir)),
+        (file, None) => file,
+    };
+    let Some(mut file) = file else {
+        return Ok(None);
+    };
+    if let Some(value) = env_value("AUTOTEL_LOG_FILE_ROTATION") {
+        file.rotation = match value.as_str() {
+            "minutely" => LogRotation::MINUTELY,
+            "hourly" => LogRotation::HOURLY,
+            "daily" => LogRotation::DAILY,
+            "never" => LogRotation::NEVER,
+            other => anyhow::bail!(
+                "AUTOTEL_LOG_FILE_ROTATION={other} is not one of minutely, hourly, daily, never"
+            ),
+        };
+    }
+    if let Some(value) = env_value("AUTOTEL_LOG_FILE_MAX_FILES") {
+        file.max_files = value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("AUTOTEL_LOG_FILE_MAX_FILES={value}: {error}"))?;
+    }
+    // Pruning runs before the new file opens, so 1 would delete the current file.
+    anyhow::ensure!(
+        file.max_files != 1,
+        "a log file needs max_files of at least 2, or 0 to keep them all"
+    );
+    let unusable = |error| anyhow::anyhow!("can't log to {}: {error}", file.dir.display());
+    std::fs::create_dir_all(&file.dir).map_err(|error| unusable(error.to_string()))?;
+    let appender = RollingFileAppender::builder()
+        .rotation(file.rotation)
+        .filename_prefix(file.prefix.as_deref().unwrap_or(service))
+        .filename_suffix(&file.suffix)
+        .max_log_files(file.max_files)
+        .build(&file.dir)
+        .map_err(|error| unusable(error.to_string()))?;
+    if file.blocking {
+        return Ok(Some((
+            BoxMakeWriter::new(std::sync::Mutex::new(appender)),
+            None,
+        )));
+    }
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    Ok(Some((BoxMakeWriter::new(writer), Some(guard))))
 }
 
 /// One JSON object per line, with the active span's `trace_id` and `span_id`

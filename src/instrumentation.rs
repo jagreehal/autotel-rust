@@ -220,17 +220,28 @@ pub(crate) fn redact_url(url: &str) -> String {
     )]
     let _ = parsed.set_password(None);
     parsed.set_fragment(None);
-    if parsed.query().is_some() {
-        let keys: Vec<String> = parsed
-            .query_pairs()
-            .map(|(key, _)| key.into_owned())
-            .collect();
-        parsed
-            .query_pairs_mut()
-            .clear()
-            .extend_pairs(keys.iter().map(|key| (key.as_str(), "REDACTED")));
-    }
+    redact_query_values(&mut parsed);
     parsed.into()
+}
+
+fn redact_query_values(url: &mut reqwest::Url) {
+    if let Some(query) = url.query() {
+        let redacted = redact_query(query);
+        url.set_query(Some(&redacted));
+    }
+}
+
+/// `a=1&secret` becomes `a=REDACTED&REDACTED`: text with no `=` is a value, not a key.
+pub(crate) fn redact_query(query: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) => format!("{key}=REDACTED"),
+            None => "REDACTED".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Attach the active W3C `traceparent` / `baggage` headers to an outgoing reqwest call.

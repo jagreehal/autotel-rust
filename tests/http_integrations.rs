@@ -304,3 +304,291 @@ async fn axum_layer_does_not_use_raw_path_for_unmatched_routes() {
         json!(404)
     );
 }
+
+fn get_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .uri(uri)
+        .header("host", "api.example.com:8443")
+        .header("user-agent", "curl/8.0")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn axum_layer_records_http_semconv_and_no_query_values() {
+    let scope = Scope::open();
+    let app = Router::new()
+        .route("/orders/{id}", get(|| async { StatusCode::OK }))
+        .layer(autotel::axum::layer());
+
+    app.oneshot(get_request("/orders/42?token=secret"))
+        .await
+        .unwrap();
+
+    let span = scope.collector.expect_span("GET /orders/{id}");
+    assert_eq!(span.attributes["url.path"], json!("/orders/42"));
+    assert_eq!(span.attributes["url.scheme"], json!("http"));
+    assert_eq!(span.attributes["server.address"], json!("api.example.com"));
+    assert_eq!(span.attributes["server.port"], json!(8443));
+    assert_eq!(span.attributes["user_agent.original"], json!("curl/8.0"));
+    assert_eq!(span.attributes["network.protocol.version"], json!("1.1"));
+    assert!(!format!("{:?}", span.attributes).contains("secret"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn axum_layer_names_nested_routes_by_their_full_template() {
+    let scope = Scope::open();
+    let api = Router::new().route("/orders/{id}", get(|| async { StatusCode::OK }));
+    let app = Router::new().nest("/v1", api).layer(autotel::axum::layer());
+
+    app.oneshot(get_request("/v1/orders/42")).await.unwrap();
+
+    scope.collector.expect_span("GET /v1/orders/{id}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn axum_layer_skips_named_routes_only() {
+    let scope = Scope::open();
+    let app = Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
+        .route("/orders", get(|| async { StatusCode::OK }))
+        .layer(autotel::axum::layer().skip_routes(["/health"]));
+
+    let health = app.clone().oneshot(get_request("/health")).await.unwrap();
+    app.oneshot(get_request("/orders")).await.unwrap();
+
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(scope.collector.by_name("GET /health").is_empty());
+    scope.collector.expect_span("GET /orders");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn axum_layer_answers_with_traceparent_only_when_asked_and_never_baggage() {
+    let scope = Scope::open();
+    let handler = || async { autotel::current_trace_id().unwrap() };
+    let routes = Router::new().route("/id", get(handler));
+    let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let request = || {
+        let mut request = get_request("/id");
+        request
+            .headers_mut()
+            .insert("traceparent", caller.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("baggage", "tenant=acme".parse().unwrap());
+        request
+    };
+
+    let plain = routes
+        .clone()
+        .layer(autotel::axum::layer())
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert!(!plain.headers().contains_key("traceparent"));
+
+    let app = routes.layer(autotel::axum::layer().trace_response_header());
+    let response = app.oneshot(request()).await.unwrap();
+    assert!(!response.headers().contains_key("baggage"));
+    let header = response.headers()["traceparent"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(header.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+    assert!(
+        !header.contains("00f067aa0ba902b7"),
+        "must name our span, not the caller's"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"4bf92f3577b34da6a3ce929d0e0e4736");
+    drop(scope);
+}
+
+fn from_peer(uri: &str, peer: &str) -> axum::http::Request<axum::body::Body> {
+    let mut request = get_request(uri);
+    let peer: std::net::SocketAddr = peer.parse().unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    request
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn axum_layer_keeps_query_keys_and_hides_values_unless_told_otherwise() {
+    let scope = Scope::open();
+    let routes = Router::new().route("/search", get(|| async { StatusCode::OK }));
+
+    let redacted = routes.clone().layer(autotel::axum::layer());
+    redacted
+        .oneshot(get_request("/search?q=rust&token=s3cret"))
+        .await
+        .unwrap();
+    let span = scope.collector.expect_span("GET /search");
+    assert_eq!(
+        span.attributes["url.query"],
+        json!("q=REDACTED&token=REDACTED")
+    );
+    drop(scope);
+
+    let scope = Scope::open();
+    let raw = routes.layer(autotel::axum::layer().raw_query());
+    raw.oneshot(get_request("/search?q=rust")).await.unwrap();
+    let span = scope.collector.expect_span("GET /search");
+    assert_eq!(span.attributes["url.query"], json!("q=rust"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn client_address_is_the_peer_and_a_forged_header_cannot_change_it() {
+    let scope = Scope::open();
+    let app = Router::new()
+        .route("/a", get(|| async { StatusCode::OK }))
+        .layer(autotel::axum::layer());
+    let mut request = from_peer("/a", "203.0.113.9:5000");
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", "6.6.6.6".parse().unwrap());
+
+    app.oneshot(request).await.unwrap();
+
+    let span = scope.collector.expect_span("GET /a");
+    assert_eq!(span.attributes["client.address"], json!("203.0.113.9"));
+    assert_eq!(
+        span.attributes["network.peer.address"],
+        json!("203.0.113.9")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trusted_forwarded_for_names_the_client_and_ignores_junk() {
+    let scope = Scope::open();
+    let routes = Router::new()
+        .route("/a", get(|| async { StatusCode::OK }))
+        .layer(autotel::axum::layer().trust_forwarded_for());
+
+    let mut request = from_peer("/a", "10.0.0.1:5000");
+    let chain = "198.51.100.7, 10.0.0.2".parse().unwrap();
+    request.headers_mut().insert("x-forwarded-for", chain);
+    routes.clone().oneshot(request).await.unwrap();
+    let span = scope.collector.expect_span("GET /a");
+    assert_eq!(span.attributes["client.address"], json!("198.51.100.7"));
+    assert_eq!(span.attributes["network.peer.address"], json!("10.0.0.1"));
+    drop(scope);
+
+    let scope = Scope::open();
+    let mut request = from_peer("/a", "10.0.0.1:5000");
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", "<script>".parse().unwrap());
+    routes.oneshot(request).await.unwrap();
+    let span = scope.collector.expect_span("GET /a");
+    assert_eq!(span.attributes["client.address"], json!("10.0.0.1"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redact_pii_drops_ip_addresses() {
+    let _scope = Scope::open();
+    let mut config = AutotelConfig::new("pii").capture_spans();
+    config.redact_pii = true;
+    let _runtime = autotel::init(config).unwrap();
+    let app = Router::new()
+        .route("/a", get(|| async { StatusCode::OK }))
+        .layer(autotel::axum::layer());
+
+    app.oneshot(from_peer("/a", "203.0.113.9:5000"))
+        .await
+        .unwrap();
+
+    let spans = autotel::completed_spans();
+    let span = spans.iter().find(|span| span.name == "GET /a").unwrap();
+    assert!(!span.attributes.contains_key("client.address"));
+    assert!(!span.attributes.contains_key("network.peer.address"));
+}
+
+/// Middleware may log or read the context in `call` itself, before its future is polled.
+#[tokio::test(flavor = "current_thread")]
+async fn axum_layer_calls_the_inner_service_inside_the_span() {
+    use tower::{Layer, service_fn};
+    let scope = Scope::open();
+    let seen = std::sync::Arc::new(Mutex::new(None));
+    let captured = seen.clone();
+    let service = service_fn(move |_: axum::extract::Request| {
+        *captured.lock().unwrap() = autotel::current_trace_id();
+        async {
+            Ok::<_, std::convert::Infallible>(axum::response::Response::new(
+                axum::body::Body::empty(),
+            ))
+        }
+    });
+
+    autotel::axum::layer()
+        .layer(service)
+        .oneshot(get_request("/a"))
+        .await
+        .unwrap();
+
+    let span = scope.collector.expect_span("GET");
+    assert_eq!(*seen.lock().unwrap(), Some(span.trace_id));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_text_with_no_key_is_a_value_and_stays_hidden() {
+    let scope = Scope::open();
+    let app = Router::new()
+        .route("/verify", get(|| async { StatusCode::OK }))
+        .layer(autotel::axum::layer());
+
+    app.oneshot(get_request("/verify?alice@example.com&page=2"))
+        .await
+        .unwrap();
+
+    let span = scope.collector.expect_span("GET /verify");
+    assert_eq!(
+        span.attributes["url.query"],
+        json!("REDACTED&page=REDACTED")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn url_full_hides_bare_query_values_too() {
+    let scope = Scope::open();
+    http_client(
+        "GET",
+        "https://api.example.com/v?alice@example.com",
+        |_| async {},
+    )
+    .await;
+
+    let span = scope.collector.expect_span("GET");
+    assert_eq!(
+        span.attributes["url.full"],
+        json!("https://api.example.com/v?REDACTED")
+    );
+}
+
+async fn scheme_with(layer: autotel::axum::AutotelLayer, forwarded: &str) -> serde_json::Value {
+    let scope = Scope::open();
+    let app = Router::new()
+        .route("/a", get(|| async { StatusCode::OK }))
+        .layer(layer);
+    let mut request = get_request("/a");
+    let forwarded = forwarded.parse().unwrap();
+    request.headers_mut().insert("x-forwarded-proto", forwarded);
+
+    app.oneshot(request).await.unwrap();
+
+    scope.collector.expect_span("GET /a").attributes["url.scheme"].clone()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forwarded_scheme_needs_a_trusted_proxy_and_a_real_scheme() {
+    let trusted = || autotel::axum::layer().trust_forwarded_for();
+
+    assert_eq!(
+        scheme_with(autotel::axum::layer(), "https").await,
+        json!("http")
+    );
+    assert_eq!(scheme_with(trusted(), "https").await, json!("https"));
+    assert_eq!(scheme_with(trusted(), "gopher").await, json!("http"));
+}

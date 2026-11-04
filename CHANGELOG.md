@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- `autotel::tonic::layer()` (`tonic` feature) records gRPC SERVER spans and `rpc.server.call.duration` with the stable RPC conventions.
+- The axum layer records URL, server, client and network attributes, and gains `skip_routes`, `trace_response_header`, `trust_forwarded_for` and `raw_query`. `url.query` keeps keys and redacts values.
+- `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_PROTOCOL` and `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` take precedence over `AutotelConfig`. `OtlpProtocol::HttpProtobuf` adds protobuf export.
+- `autotel::config!()` reads the service name and version from `Cargo.toml`. `LogFile` and `AUTOTEL_LOG_FILE_*` write rolling log files.
+- `shutdown_signal()`, `current_trace_id()`, and an `init` log line naming where each signal goes.
+
 ## 0.1.0
 
 First release.

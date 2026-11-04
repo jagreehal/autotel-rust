@@ -1,10 +1,10 @@
 [package]
 name = "autotel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Jag Reehal"]
-description = "Write Once, Observe Everywhere: ergonomic OpenTelemetry for Rust"
+description = "OpenTelemetry for Rust with one line of setup: traces, metrics and logs over OTLP"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/jagreehal/autotel-rust"
@@ -27,6 +27,8 @@ default = []
 axum = ["dep:axum", "dep:tower"]
 ## Export traces/metrics/logs over OTLP/gRPC (tonic) instead of OTLP/HTTP JSON.
 grpc = ["opentelemetry-otlp/grpc-tonic"]
+## Tower layer that records gRPC SERVER spans for tonic services.
+tonic = ["dep:tonic", "dep:tower", "dep:http-body", "dep:axum"]
 ## SQLx transaction helper and pool metrics (Postgres + SQLite).
 sqlx = ["dep:sqlx"]
 
@@ -35,10 +37,11 @@ anyhow = "1.0.104"
 axum = { version = "0.8.9", optional = true }
 tower = { version = "0.5.3", optional = true, default-features = false }
 http = "1.5.0"
+http-body = { version = "1.1.0", optional = true }
 opentelemetry = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
 opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-http = "0.33.1"
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-json", "logs", "metrics", "reqwest-blocking-client", "trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-json", "http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.33.1", features = ["logs", "metrics", "rt-tokio", "trace"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
@@ -47,12 +50,23 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 sqlx = { version = "0.8.6", optional = true, default-features = false, features = ["runtime-tokio", "postgres", "sqlite"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt"] }
+tonic = { version = "0.14.6", optional = true, default-features = false, features = ["server"] }
+tokio = { version = "1.54.1", features = ["macros", "rt", "signal"] }
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry", "std"] }
 
 [dev-dependencies]
+axum = { version = "0.8.9", features = ["http2"] }
+bytes = "1"
+http-body = "1.1.0"
+http-body-util = "0.1.3"
+rcgen = "0.14.10"
+tonic = { version = "0.14.6", features = ["transport", "tls-aws-lc"] }
+tonic-health = "0.14.6"
+tokio-rustls = "0.26"
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio = { version = "1.54.1", features = ["full"] }
 executable-stories = "0.2.0"
 opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
@@ -60,6 +74,14 @@ dtor = "1.0.6"
 serde_json = "1.0.154"
 tower = "0.5.3"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+[[example]]
+name = "axum"
+required-features = ["axum"]
+
+[[example]]
+name = "tonic"
+required-features = ["tonic"]
 
 [lints.rust]
 unsafe_code = "forbid"

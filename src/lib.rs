@@ -1,4 +1,18 @@
-//! Ergonomic, production-minded OpenTelemetry instrumentation for Rust.
+//! OpenTelemetry for Rust with one line of setup.
+//!
+//! [`init`] builds the exporters, providers and `tracing` bridges, and [`config!`] reads
+//! the service name and version from `Cargo.toml`. The guard [`init`] returns flushes on
+//! drop.
+//!
+//! ```no_run
+//! # fn main() -> anyhow::Result<()> {
+//! let _telemetry = autotel::init(autotel::config!().with_tracing_subscriber())?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export. Wrap work in [`trace`], and add
+//! `autotel::axum::layer()` or `autotel::tonic::layer()` to a server.
 
 mod analysis;
 #[cfg(feature = "axum")]
@@ -11,10 +25,14 @@ mod instruments;
 mod logs;
 mod propagation;
 mod sampling;
+#[cfg(any(feature = "axum", feature = "tonic"))]
+mod server_attrs;
 mod slo;
 #[cfg(feature = "sqlx")]
 mod sqlx_support;
 mod tail_sampling;
+#[cfg(feature = "tonic")]
+mod tonic_layer;
 mod utilities;
 mod validation;
 
@@ -38,6 +56,12 @@ pub use validation::*;
 pub mod axum {
     //! Axum middleware: extract W3C context and start a SERVER HTTP span.
     pub use crate::axum_layer::{AutotelLayer, AutotelMiddleware, layer, middleware};
+}
+
+#[cfg(feature = "tonic")]
+pub mod tonic {
+    //! Tower layer that records gRPC SERVER spans for tonic services.
+    pub use crate::tonic_layer::{AutotelLayer, AutotelMiddleware, TracedBody, layer};
 }
 
 pub use opentelemetry::{KeyValue, context::FutureExt, trace::SpanKind};
