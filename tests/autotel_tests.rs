@@ -1,9 +1,14 @@
 use autotel::*;
 use serde_json::json;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+/// `init` clears the process-wide span buffer, so collectors take turns.
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test(flavor = "current_thread")]
 async fn trace_collector_records_hierarchy() {
+    let _serial = SERIAL.lock().await;
     let collector = TraceCollector::new("tests").unwrap();
     trace("parent", |_| async {
         trace("child", |_| async {}).await;
@@ -113,6 +118,7 @@ fn structured_error_preserves_remediation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn safe_set_uses_the_shared_redaction_rules() {
+    let _serial = SERIAL.lock().await;
     let collector = TraceCollector::new("tests").unwrap();
     trace("safe_set.span", |ctx| async move {
         safe_set(
