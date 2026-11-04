@@ -304,4 +304,4 @@ Open the repository in its Rust devcontainer, then run `make quality`. Run one w
 
 ## Releasing
 
-Bump `version` in `Cargo.toml`, move the changelog entries under the new version, then push a tag `v<version>`. The `Release` workflow checks the tag matches, runs the tests and publishes to crates.io (needs the `CARGO_REGISTRY_TOKEN` secret in the `main` environment).
+Bump `version` in `Cargo.toml`, move the changelog entries under the new version, then push a tag `v<version>`. The `Release` workflow checks the tag matches, runs the tests, publishes to crates.io (needs the `CARGO_REGISTRY_TOKEN` secret in the `main` environment) and creates a GitHub release from that changelog section.
