@@ -1,6 +1,6 @@
 //! Semantic-convention metrics that autotel records on its own: HTTP server and
-//! client duration, database operation duration, pool wait time, and Tokio
-//! runtime gauges.
+//! client duration, gRPC server duration, database operation duration, pool wait
+//! time, and Tokio runtime gauges.
 
 use crate::{INSTRUMENTATION_NAME, SpanData};
 use opentelemetry::{KeyValue, global, metrics::Histogram};
@@ -13,9 +13,19 @@ pub(crate) const DURATION_BOUNDARIES: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
 
+/// Semconv-advised boundaries for gRPC's `rpc.server.call.duration` (seconds).
+#[cfg(feature = "tonic")]
+const GRPC_DURATION_BOUNDARIES: [f64; 41] = [
+    0.0, 0.00001, 0.00005, 0.0001, 0.0003, 0.0006, 0.0008, 0.001, 0.002, 0.003, 0.004, 0.005,
+    0.006, 0.008, 0.01, 0.013, 0.016, 0.02, 0.025, 0.03, 0.04, 0.05, 0.065, 0.08, 0.1, 0.13, 0.16,
+    0.2, 0.25, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0,
+];
+
 pub(crate) struct Instruments {
     pub http_server_duration: Histogram<f64>,
     pub http_client_duration: Histogram<f64>,
+    #[cfg(feature = "tonic")]
+    pub rpc_server_duration: Histogram<f64>,
     pub db_operation_duration: Histogram<f64>,
     #[cfg_attr(not(feature = "sqlx"), allow(dead_code))]
     pub db_connection_wait_time: Histogram<f64>,
@@ -41,6 +51,13 @@ impl Instruments {
                 "http.client.request.duration",
                 "Duration of outbound HTTP requests",
             ),
+            #[cfg(feature = "tonic")]
+            rpc_server_duration: global::meter(INSTRUMENTATION_NAME)
+                .f64_histogram("rpc.server.call.duration")
+                .with_unit("s")
+                .with_description("Duration of inbound RPCs")
+                .with_boundaries(GRPC_DURATION_BOUNDARIES.to_vec())
+                .build(),
             db_operation_duration: seconds_histogram(
                 "db.client.operation.duration",
                 "Duration of database client operations",
@@ -119,6 +136,25 @@ pub(crate) fn record_http_server(
         attrs.push(KeyValue::new("error.type", error));
     }
     with(|i| i.http_server_duration.record(elapsed.as_secs_f64(), &attrs));
+}
+
+/// `method` must be bounded: `_OTHER` for one the server doesn't recognise.
+#[cfg(feature = "tonic")]
+pub(crate) fn record_rpc_server(
+    method: &str,
+    status: &'static str,
+    failed: bool,
+    elapsed: Duration,
+) {
+    let mut attrs = vec![
+        KeyValue::new("rpc.system.name", "grpc"),
+        KeyValue::new("rpc.method", method.to_owned()),
+        KeyValue::new("rpc.status_code", status),
+    ];
+    if failed {
+        attrs.push(KeyValue::new("error.type", status));
+    }
+    with(|i| i.rpc_server_duration.record(elapsed.as_secs_f64(), &attrs));
 }
 
 pub(crate) fn record_http_client(method: &str, url: &str, span: &SpanData, elapsed: Duration) {

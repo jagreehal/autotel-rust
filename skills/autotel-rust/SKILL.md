@@ -11,31 +11,34 @@ description: >
 
 `autotel` wraps the OpenTelemetry SDK. Call `init` once, wrap work in `trace`, and traces, metrics and logs go out over OTLP.
 
+Add `autotel` as the only telemetry dependency. `init` builds the exporters, providers and `tracing` bridges, and W3C propagation is built in, so skip `opentelemetry_sdk`, `opentelemetry-otlp` and `tracing-opentelemetry` setup code.
+
 ## Setup
 
 ```toml
 [dependencies]
-autotel = { version = "0.1", features = ["axum"] } # optional: axum, grpc, sqlx
+autotel = { version = "0.2", features = ["axum"] } # optional: axum, tonic, grpc, sqlx
 ```
 
 ```rust
-use autotel::{AdaptiveSampler, AutotelConfig, init};
+use autotel::{AdaptiveSampler, init};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _telemetry = init(
-        AutotelConfig::new("checkout-api")
+        autotel::config!() // name and version from Cargo.toml
             .with_tracing_subscriber()
             .sampler(AdaptiveSampler::production()),
     )?;
-    // run the app; dropping `_telemetry` flushes and shuts down
+    // run the app with `.with_graceful_shutdown(autotel::shutdown_signal())`;
+    // dropping `_telemetry` at the end of main flushes and shuts down
     Ok(())
 }
 ```
 
 - Keep the guard alive. `let _ = init(...)` drops it on the spot and loses every span.
-- `OTEL_EXPORTER_OTLP_ENDPOINT` sets the collector URL. `.devtools()` sends to `autotel-devtools` on `127.0.0.1:4318` (`npx autotel-devtools`).
-- `.with_tracing_subscriber()` installs fmt + `span_bridge()` + `log_bridge()` with a `RUST_LOG` filter. Leave it off if your app builds its own subscriber, and add `span_bridge()` and `log_bridge()` to that one.
+- `OTEL_*` variables beat code: `OTEL_EXPORTER_OTLP_ENDPOINT`, `_PROTOCOL` (`http/json`, `http/protobuf`, `grpc`), `_HEADERS`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none`. `init` logs where telemetry goes. `.devtools()` sends to `autotel-devtools` on `127.0.0.1:4318` (`npx autotel-devtools`).
+- `.json_logs()` prints JSON lines with `trace_id`. `.with_tracing_subscriber()` installs fmt + `span_bridge()` + `log_bridge()` with a `RUST_LOG` filter. Leave it off if your app builds its own subscriber, and add `span_bridge()` and `log_bridge()` to that one.
 - Set `redact_pii: true` on the config to scrub emails, card numbers, tokens and passwords at export.
 
 ## Which API
@@ -50,6 +53,13 @@ async fn main() -> anyhow::Result<()> {
 | `#[instrument]` spans in the same trace | `span_bridge()` layer |
 | Logs linked to spans | `log_bridge()` layer; `JsonWithTraceIds` for stdout |
 | Incoming HTTP | `.layer(autotel::axum::layer())` or `http_server(method, route, \|ctx\| ..)` |
+| Incoming gRPC (`tonic` feature) | `Server::builder().layer(autotel::tonic::layer())`; behind axum, on the router with connect info |
+| Recognised gRPC methods | `autotel::tonic::layer().methods(["package.Service/Method"])` when auth runs before routing |
+| Caller's IP | `into_make_service_with_connect_info`; `.trust_forwarded_for()` only behind a proxy |
+| Query values on spans | Redacted by default; `.raw_query()` records them as sent |
+| Log files | `.log_file(LogFile::new("logs"))` or `AUTOTEL_LOG_FILE_DIR` |
+| Keep probes out of traces | `layer().skip_routes(["/health"])` |
+| Trace id for callers | `layer().trace_response_header()` or `current_trace_id()` in the body |
 | Outgoing HTTP with propagation | `fetch(Method::GET, url, \|req\| req)` or `http_client` + `inject_request` |
 | Propagate by hand | `inject_trace_context`, `extract_trace_context` |
 | Database call | `database(system, operation, db, collection, \|ctx\| ..)`; `ctx.set_query_text(sql)` |
