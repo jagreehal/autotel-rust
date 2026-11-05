@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 - `TraceCollector` works in parallel tests. `new` waits for the open collector to drop, so each test sees only its own spans.
 
