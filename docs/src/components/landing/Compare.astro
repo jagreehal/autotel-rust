@@ -1,0 +1,309 @@
+---
+const before = `use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider as _};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{
+    Resource,
+    logs::SdkLoggerProvider,
+    metrics::SdkMeterProvider,
+    propagation::{BaggagePropagator, TraceContextPropagator},
+    trace::SdkTracerProvider,
+};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let resource = Resource::builder()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .with_attribute(opentelemetry::KeyValue::new(
+            "service.version",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build();
+
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(
+            SpanExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpJson)
+                .build()?,
+        )
+        .build();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource.clone())
+        .with_periodic_exporter(
+            MetricExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpJson)
+                .build()?,
+        )
+        .build();
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(
+            LogExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpJson)
+                .build()?,
+        )
+        .build();
+
+    global::set_tracer_provider(tracer_provider.clone());
+    global::set_meter_provider(meter_provider.clone());
+    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]));
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("orders")))
+        .with(OpenTelemetryTracingBridge::new(&logger_provider))
+        .init();
+
+    // your service runs here
+
+    tracer_provider.force_flush()?;
+    tracer_provider.shutdown()?;
+    meter_provider.shutdown()?;
+    logger_provider.shutdown()?;
+    Ok(())
+}`;
+
+const after = `#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _telemetry = autotel::init(autotel::config!().with_tracing_subscriber())?;
+    // your service runs here
+    Ok(())
+}`;
+---
+
+<section class="compare" aria-labelledby="compare-title">
+  <div class="compare__inner">
+    <header class="compare__head">
+      <p class="compare__eyebrow">Before / after</p>
+      <h2 id="compare-title" class="compare__title">
+        Same telemetry. 6 lines in place of 66.
+      </h2>
+      <p class="compare__sub">
+        Both versions export traces, metrics and logs over OTLP. The left side
+        needs six crates on matching versions, and the right side needs one.
+      </p>
+    </header>
+
+    <div class="compare__grid sl-markdown-no-margin">
+      <figure class="panel panel--before">
+        <figcaption class="panel__head">
+          <span class="panel__tag">wired by hand</span>
+          <span class="panel__count">66 lines</span>
+        </figcaption>
+        <pre class="panel__code"><code>{before}</code></pre>
+      </figure>
+
+      <figure class="panel panel--after">
+        <figcaption class="panel__head">
+          <span class="panel__tag panel__tag--accent">
+            <span class="panel__tag-dot" aria-hidden="true"></span>
+            autotel
+          </span>
+          <span class="panel__count">6 lines</span>
+        </figcaption>
+        <pre class="panel__code"><code>{after}</code></pre>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<style>
+  .compare {
+    border-top: 1px solid var(--color-charcoal-grey);
+    padding-block: var(--section-pad, clamp(3rem, 6vw, 5rem));
+  }
+
+  :root[data-theme='light'] .compare {
+    border-top-color: var(--sl-color-gray-5);
+  }
+
+  .compare__inner {
+    max-width: 72rem;
+    margin-inline: auto;
+    padding-inline: clamp(1rem, 4vw, 2rem);
+  }
+
+  .compare__head {
+    max-width: 48rem;
+    margin-bottom: 3rem;
+  }
+
+  .compare__eyebrow {
+    margin: 0 0 0.5rem;
+    font-family: var(--sl-font);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--color-storm-cloud);
+    font-weight: 510;
+  }
+
+  .compare__title {
+    margin: 0 0 0.625rem;
+    font-family: var(--sl-font);
+    font-size: clamp(1.5rem, 3vw, 2.125rem);
+    line-height: 1.18;
+    letter-spacing: -0.02em;
+    color: var(--color-porcelain);
+    font-weight: 590;
+    border: 0;
+  }
+
+  :root[data-theme='light'] .compare__title {
+    color: var(--color-pitch-black);
+  }
+
+  .compare__sub {
+    margin: 0;
+    color: var(--color-light-steel);
+    font-size: 0.9375rem;
+    line-height: 1.55;
+    max-width: 38rem;
+    letter-spacing: -0.012em;
+  }
+
+  :root[data-theme='light'] .compare__sub {
+    color: var(--sl-color-gray-2);
+  }
+
+  .compare__grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  @media (min-width: 900px) {
+    .compare__grid {
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      align-items: start;
+    }
+  }
+
+    .panel {
+    margin: 0;
+    border: 1px solid var(--color-charcoal-grey);
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--color-graphite);
+    box-shadow: var(--shadow-card);
+  }
+
+  :root[data-theme='light'] .panel {
+    border-color: var(--sl-color-gray-5);
+    background: var(--sl-color-bg-inline-code);
+  }
+
+  /* "after" panel: elevated surface + single blue hairline. */
+  .panel--after {
+    background: var(--color-deep-slate);
+    position: relative;
+  }
+
+  :root[data-theme='light'] .panel--after {
+    background: #ffffff;
+  }
+
+  .panel--after::before {
+    content: '';
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: var(--color-porcelain);
+    opacity: 0.9;
+    z-index: 1;
+  }
+
+  .panel__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.625rem 0.95rem;
+    border-bottom: 1px solid var(--color-charcoal-grey);
+    font-family: var(--sl-font-mono);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--color-fog-grey);
+  }
+
+  :root[data-theme='light'] .panel__head {
+    border-bottom-color: var(--sl-color-gray-5);
+  }
+
+  .panel__tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .panel__tag--accent {
+    color: var(--color-porcelain);
+    font-weight: 510;
+    letter-spacing: 0.06em;
+  }
+
+  :root[data-theme='light'] .panel__tag--accent {
+    color: var(--color-pitch-black);
+  }
+
+  :root[data-theme='light'] .panel--after::before,
+  :root[data-theme='light'] .panel__tag-dot {
+    background: var(--color-pitch-black);
+  }
+
+  .panel__tag-dot {
+    width: 0.375rem;
+    height: 0.375rem;
+    border-radius: 999px;
+    background: var(--color-porcelain);
+  }
+
+  .panel__count {
+    color: var(--color-fog-grey);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .panel__code {
+    margin: 0;
+    padding: 1rem 1.125rem 1.25rem;
+    background: transparent;
+    font-family: var(--sl-font-mono);
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: var(--color-light-steel);
+    overflow-x: auto;
+    border: 0;
+    border-radius: 0;
+    letter-spacing: -0.005em;
+  }
+
+  :root[data-theme='light'] .panel__code {
+    color: var(--sl-color-gray-2);
+  }
+
+  .panel__code code {
+    background: transparent;
+    padding: 0;
+    color: inherit;
+  }
+
+  .panel--after .panel__code {
+    color: var(--color-porcelain);
+    white-space: pre-wrap;
+  }
+
+  :root[data-theme='light'] .panel--after .panel__code {
+    color: var(--color-pitch-black);
+  }
+</style>

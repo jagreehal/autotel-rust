@@ -1,0 +1,27 @@
+{
+  "name": "autotel",
+  "short_name": "autotel",
+  "description": "OpenTelemetry for Rust in one line of setup",
+  "icons": [
+    {
+      "src": "/autotel-rust/android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/autotel-rust/android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/autotel-rust/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ],
+  "theme_color": "#dc2626",
+  "background_color": "#17181c",
+  "display": "standalone",
+  "start_url": "/autotel-rust/",
+  "scope": "/autotel-rust/"
+}

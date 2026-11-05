@@ -4,6 +4,8 @@
 [![docs.rs](https://docs.rs/autotel/badge.svg)](https://docs.rs/autotel)
 [![CI](https://github.com/jagreehal/autotel-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/jagreehal/autotel-rust/actions/workflows/ci.yml)
 
+[Documentation](https://jagreehal.github.io/autotel-rust/) · [crates.io](https://crates.io/crates/autotel) · [API reference](https://docs.rs/autotel)
+
 Write Once, Observe Everywhere: ergonomic OpenTelemetry for Rust.
 
 **One line of setup. Traces, metrics and logs out over OTLP.**
@@ -19,7 +21,7 @@ That line replaces the 60 lines of provider, exporter, propagator and subscriber
 | | Wired by hand | autotel |
 | --- | --- | --- |
 | Crates to add and keep on matching versions | 6 | 1 |
-| Lines from `use` to `Ok(())`, after `rustfmt` | 66 | 6 |
+| Non-blank lines after `rustfmt` | 66 | 6 |
 | Lines to trace an axum or tonic server | Your own middleware | 1 |
 
 <details>
@@ -301,6 +303,8 @@ npx skills add jagreehal/autotel-rust --skill autotel-rust
 ## Verification
 
 Open the repository in its Rust devcontainer, then run `make quality`. Run one workshop part with `cargo sol 10` (start `npx autotel-devtools` first to see its telemetry), or check every part against a throwaway receiver with `make workshop`. The workshop check needs Node 22 or newer for `autotel-devtools`.
+
+The documentation site lives in `docs/`. Run `npm ci && npm run dev` there to preview it. Merges to `main` deploy it to GitHub Pages.
 
 ## Releasing
 
