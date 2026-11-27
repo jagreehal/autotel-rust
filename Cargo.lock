@@ -510,10 +510,11 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dtor"
-version = "1.0.6"
+version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd3f6c362b2bbd7063090886afd78978f5dbf1f11da7efcc40f81d32c943fac1"
+checksum = "915e80ae7aca23bef767ded8e4a763d0c912c2faaa8bfec1e66d505ebaceb254"
 dependencies = [
+ "link-section",
  "linktime-proc-macro",
 ]
 
@@ -1233,6 +1234,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "link-section"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d9aae57673c1a235149777a74d152f3210ebd3e3b13346d2cdb6809e566bd3c"
 
 [[package]]
 name = "linktime-proc-macro"
