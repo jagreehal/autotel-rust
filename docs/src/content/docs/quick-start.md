@@ -10,7 +10,7 @@ Add the [`autotel` crate](https://crates.io/crates/autotel):
 ```sh
 cargo add autotel anyhow tracing
 cargo add tokio --features macros,rt-multi-thread
-# optional autotel features: axum, tonic, grpc, sqlx
+# optional autotel features: axum, tonic, grpc, sqlx, console
 ```
 
 ## Trace some work

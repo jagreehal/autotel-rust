@@ -523,3 +523,129 @@ async fn grpc_web_passes_through_and_codecs_and_parameters_count_as_grpc() {
     }
     assert_eq!(scope.collector.by_name("a.B/C").len(), 2);
 }
+
+async fn traced_client(
+    address: SocketAddr,
+) -> HealthClient<autotel::tonic::ClientMiddleware<Channel>> {
+    let channel = Channel::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    HealthClient::new(autotel::tonic::client(channel))
+}
+
+/// The CLIENT and SERVER spans of one Check call, which share a name.
+async fn client_and_server(collector: &TraceCollector) -> (SpanData, SpanData) {
+    for _ in 0..200 {
+        let spans = collector.by_name("grpc.health.v1.Health/Check");
+        let kind = |kind: &str| {
+            spans
+                .iter()
+                .find(|span| span.attributes["otel.span.kind"] == json!(kind))
+                .cloned()
+        };
+        if let (Some(client), Some(server)) = (kind("client"), kind("server")) {
+            return (client, server);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("no client and server spans: {:?}", collector.spans());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_layer_opens_a_client_span_the_server_span_joins() {
+    let scope = Scope::open();
+    let collector = &scope.collector;
+    let (_, _reporter, address) = start().await;
+    let mut client = traced_client(address).await;
+
+    trace("caller", |_| async {
+        client.check(check("orders")).await.unwrap();
+    })
+    .await;
+
+    let (client_span, server) = client_and_server(collector).await;
+    let caller = collector.expect_span("caller");
+    assert_eq!(
+        client_span.parent_span_id.as_deref(),
+        Some(caller.span_id.as_str())
+    );
+    assert_eq!(
+        server.parent_span_id.as_deref(),
+        Some(client_span.span_id.as_str())
+    );
+    assert_eq!(client_span.attributes["rpc.system.name"], json!("grpc"));
+    assert_eq!(
+        client_span.attributes["rpc.method"],
+        json!("grpc.health.v1.Health/Check")
+    );
+    assert_eq!(client_span.attributes["rpc.status_code"], json!("OK"));
+    assert_eq!(client_span.error, None);
+    // A bare Channel adds its endpoint below the layer, so nothing to read yet.
+    assert!(!client_span.attributes.contains_key("server.address"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_address_comes_from_server_without_ipv6_brackets() {
+    let scope = Scope::open();
+    let collector = &scope.collector;
+    let (reporter, service) = health_reporter();
+    reporter
+        .set_service_status("orders", ServingStatus::Serving)
+        .await;
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    tokio::spawn(
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming),
+    );
+    let uri: http::Uri = format!("http://[::1]:{port}").parse().unwrap();
+    let channel = Channel::builder(uri.clone()).connect().await.unwrap();
+    let mut client = HealthClient::new(autotel::tonic::client(channel).server(&uri));
+
+    client.check(check("orders")).await.unwrap();
+
+    let span = span_named(collector, "grpc.health.v1.Health/Check").await;
+    assert_eq!(span.attributes["server.address"], json!("::1"));
+    assert_eq!(span.attributes["server.port"], json!(port));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn any_non_ok_code_is_an_error_on_the_client_span() {
+    let scope = Scope::open();
+    let collector = &scope.collector;
+    let (_, _reporter, address) = start().await;
+    let mut client = traced_client(address).await;
+
+    let status = client.check(check("missing")).await.unwrap_err();
+
+    assert_eq!(status.code(), Code::NotFound);
+    let (client_span, server) = client_and_server(collector).await;
+    assert_eq!(client_span.attributes["error.type"], json!("NOT_FOUND"));
+    assert!(client_span.error.is_some());
+    assert!(!server.attributes.contains_key("error.type"));
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_that_never_reaches_a_server_is_unavailable() {
+    let scope = Scope::open();
+    let collector = &scope.collector;
+    // Bound then dropped, so nothing listens on it.
+    let address = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let channel = Channel::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_lazy();
+    let mut client = HealthClient::new(autotel::tonic::client(channel));
+
+    client.check(check("orders")).await.unwrap_err();
+
+    let span = span_named(collector, "grpc.health.v1.Health/Check").await;
+    assert_eq!(span.attributes["rpc.status_code"], json!("UNAVAILABLE"));
+    assert!(span.error.is_some());
+}

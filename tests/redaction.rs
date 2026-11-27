@@ -26,6 +26,7 @@ async fn bridged_spans_are_redacted() {
             redact_pii: true,
             ..AutotelConfig::new("redaction")
         }
+        .redact_keys(["Session", " "])
         .subscriber(Capture(Arc::clone(&events))),
     )
     .unwrap();
@@ -47,7 +48,8 @@ async fn bridged_spans_are_redacted() {
             api_token = "abc123",
             access_tokens = "abc,def",
             gen_ai.usage.input_tokens = 12,
-            plan = "pro"
+            plan = "pro",
+            session_id = "s-1"
         );
         let _entered = span.enter();
         tracing::info!(card_number = "4111111111111111", "charged jo@example.com");
@@ -71,6 +73,7 @@ async fn bridged_spans_are_redacted() {
     assert_eq!(value("access_tokens").as_deref(), Some("[REDACTED]"));
     assert_eq!(value("gen_ai.usage.input_tokens").as_deref(), Some("12"));
     assert_eq!(value("plan").as_deref(), Some("pro"));
+    assert_eq!(value("session_id").as_deref(), Some("[REDACTED]"));
     let event = span.events.iter().next().expect("log became a span event");
     let card = event
         .attributes

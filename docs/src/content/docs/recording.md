@@ -8,11 +8,11 @@ description: Every signal autotel records, and which API to reach for.
 - `span_bridge()` puts `#[tracing::instrument]` spans into the same traces as `trace()`, parented both ways. `log_bridge()` links each `tracing` event to its span. `.with_tracing_subscriber()` installs both with a `RUST_LOG` filter that `set_log_filter` changes at runtime.
 - W3C `traceparent` and `baggage` propagation: `inject_trace_context`, `extract_trace_context`, `inject_request`, `fetch`.
 - Axum middleware (`axum` feature): `.layer(autotel::axum::layer())` joins the caller's trace and records SERVER spans with a bounded `http.route`, plus `url.path`, `url.scheme`, `server.address`, `user_agent.original` and `network.protocol.version`. `.skip_routes(["/health"])` leaves probes out, `.trace_response_header()` answers with `traceparent`, and `current_trace_id()` puts the id in an error body.
-- gRPC server spans (`tonic` feature): `.layer(autotel::tonic::layer())` records `rpc.method` and `rpc.status_code` from the stable RPC conventions, with the span open for the whole stream, and `rpc.server.call.duration`.
+- gRPC server spans (`tonic` feature): `.layer(autotel::tonic::layer())` records `rpc.method` and `rpc.status_code` from the stable RPC conventions, with the span open for the whole stream, and `rpc.server.call.duration`. `autotel::tonic::client(channel)` does the same for outgoing calls, with CLIENT spans and `rpc.client.call.duration`.
 - Rolling log files through `.log_file(LogFile::new("logs"))` or `AUTOTEL_LOG_FILE_DIR`.
 - HTTP, database, messaging and workflow helpers set semconv attributes and record `http.server.request.duration`, `http.client.request.duration` and `db.client.operation.duration`. `ctx.set_query_text` records `db.query.text` with literals removed.
 - SQLx helpers (`sqlx` feature): `with_transaction`, `acquire` and `register_pool_metrics`.
-- `redact_pii` scrubs emails, card numbers, tokens and passwords from attributes, span events, logs and business events at export. `url.full` drops credentials and query values.
+- `redact_pii` scrubs emails, card numbers, tokens and passwords from attributes, span events, logs and business events at export. `url.full` drops credentials and query values. `.redact_keys(["authorization"])` adds your own key fragments.
 - Process-local tail sampling: `AdaptiveSampler::production()` keeps errors, slow traces and a baseline share of this service's spans, with `force_keep()`, `autotel.debug` baggage and `keep_when` rules. For one decision across services, use the Collector's `tail_sampling` processor.
 - Wide events (`request_logger()`), `StructuredError`, and Tokio runtime metrics (`register_runtime_metrics()`).
 
@@ -29,6 +29,8 @@ description: Every signal autotel records, and which API to reach for.
 | --- | --- |
 | Span around async work | `trace("name", \|ctx\| async move { .. }).await` |
 | Span that records `Err` as an error | `trace_result("name", \|ctx\| async move { .. }).await` |
+| Error type and cause chain on the span | `ctx.record_exception(&err)` |
+| Panics on the active span and in logs | `install_panic_hook()` after `init` |
 | Set a span kind | `trace_kind("name", SpanKind::Consumer, \|ctx\| ..)` |
 | Attributes and events | `ctx.set_attribute(k, v)`, `ctx.set_attributes(..)`, `ctx.add_event(..)` |
 | Current span from anywhere | `autotel::ctx()` or `current_context()` |
@@ -36,6 +38,7 @@ description: Every signal autotel records, and which API to reach for.
 | Logs linked to spans | `log_bridge()` layer; `JsonWithTraceIds` for stdout |
 | Incoming HTTP | `.layer(autotel::axum::layer())` or `http_server(method, route, \|ctx\| ..)` |
 | Incoming gRPC (`tonic` feature) | `Server::builder().layer(autotel::tonic::layer())`; behind axum, on the router with connect info |
+| Outgoing gRPC (`tonic` feature) | `GreeterClient::new(autotel::tonic::client(channel).server(endpoint.uri()))`, or `client_layer()` in a `ServiceBuilder` |
 | Recognised gRPC methods | `autotel::tonic::layer().methods(["package.Service/Method"])` when auth runs before routing |
 | Caller's IP | `into_make_service_with_connect_info`; `.trust_forwarded_for()` only behind a proxy |
 | Query values on spans | Redacted by default; `.raw_query()` records them as sent |
@@ -44,7 +47,7 @@ description: Every signal autotel records, and which API to reach for.
 | Trace id for callers | `layer().trace_response_header()` or `current_trace_id()` in the body |
 | Outgoing HTTP with propagation | `fetch(Method::GET, url, \|req\| req)` or `http_client` + `inject_request` |
 | Propagate by hand | `inject_trace_context`, `extract_trace_context` |
-| Database call | `database(system, operation, db, collection, \|ctx\| ..)`; `ctx.set_query_text(sql)` |
+| Database call | `database(system, operation, db, collection, \|ctx\| ..)`, or `database_result` to fail the span on `Err`; `ctx.set_query_text(sql)` |
 | SQLx (`sqlx` feature) | `with_transaction`, `acquire`, `register_pool_metrics` |
 | Queues and workflows | `produce`, `consume`, `workflow`, `step` |
 | LLM calls | `gen_ai(GenAiOptions, \|ctx\| ..)`, `record_gen_ai_usage`, `GenAiMetrics` |
@@ -53,7 +56,7 @@ description: Every signal autotel records, and which API to reach for.
 | Business events | `track(name, attrs)` with `.subscriber(FileSubscriber::new(path)?)` |
 | Baggage for child spans | `with_baggage(map, \|\| async { .. })`; `.baggage("app.")` copies it onto spans |
 | Keep one trace | `ctx.force_keep()` or `autotel::force_keep()` |
-| Metrics | `counter`, `histogram`, `up_down_counter`, `register_runtime_metrics()` |
+| Metrics | `counter`, `histogram`, `up_down_counter`, `gauge`, each with a `_with` variant that takes attributes; `observe_gauge`, `observe_counter`, `observe_up_down_counter` read a value at each export (refresh an atomic from a task for async sources); `create_counter` and `create_histogram` return `autotel::Counter` and `autotel::Histogram`; `register_runtime_metrics()` |
 | Change log level at runtime | `set_log_filter("debug")` |
 
 ## Spawned tasks

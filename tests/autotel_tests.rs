@@ -131,3 +131,64 @@ async fn safe_set_uses_the_shared_redaction_rules() {
     assert_eq!(span.attributes["note"], json!("password=[REDACTED]"));
     assert_eq!(span.attributes["plan"], json!("pro"));
 }
+
+#[derive(Debug)]
+struct Outer(std::io::Error);
+
+impl std::fmt::Display for Outer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("saving order")
+    }
+}
+
+impl std::error::Error for Outer {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_exception_keeps_type_and_cause_chain() {
+    let collector = TraceCollector::new("tests").unwrap();
+    trace("exception.span", |ctx| async move {
+        ctx.record_exception(&Outer(std::io::Error::other("disk full")));
+    })
+    .await;
+    let span = collector.expect_span("exception.span");
+    assert_eq!(span.error.as_deref(), Some("saving order: disk full"));
+    let event = &span.events[0];
+    assert_eq!(
+        event.attributes["exception.type"],
+        json!("autotel_tests::Outer")
+    );
+    assert_eq!(span.attributes["error.type"], json!("autotel_tests::Outer"));
+}
+
+#[test]
+fn invalid_otlp_header_fails_init() {
+    let error = init(AutotelConfig::new("headers").otlp_headers([("bad name", "v")]))
+        .err()
+        .expect("init rejects the header");
+    assert!(error.to_string().contains("bad name"), "{error}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_span_cut_short_ends_as_a_failure() {
+    let collector = TraceCollector::new("tests").unwrap();
+    let timed_out = tokio::time::timeout(
+        Duration::from_millis(5),
+        trace("cut.by.timeout", |_| {
+            tokio::time::sleep(Duration::from_secs(5))
+        }),
+    )
+    .await;
+    assert!(timed_out.is_err());
+    let joined = tokio::spawn(trace("cut.by.panic", |_| async { panic!("boom") })).await;
+    assert!(joined.is_err());
+
+    let cancelled = collector.expect_span("cut.by.timeout");
+    assert_eq!(cancelled.attributes["error.type"], json!("cancelled"));
+    assert!(cancelled.error.is_some());
+    let panicked = collector.expect_span("cut.by.panic");
+    assert_eq!(panicked.attributes["error.type"], json!("panic"));
+}

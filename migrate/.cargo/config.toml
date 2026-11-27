@@ -1,0 +1,6 @@
+# Print every signal to stdout, like the stdout-exporter examples beside this one.
+# A variable already set in your shell wins, e.g. OTEL_TRACES_EXPORTER=otlp.
+[env]
+OTEL_TRACES_EXPORTER = "console"
+OTEL_METRICS_EXPORTER = "console"
+OTEL_LOGS_EXPORTER = "console"

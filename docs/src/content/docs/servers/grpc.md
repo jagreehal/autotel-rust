@@ -4,7 +4,7 @@ description: Trace a tonic server with one layer.
 ---
 
 ```toml
-autotel = { version = "0.2", features = ["tonic"] }
+autotel = { version = "0.3", features = ["tonic"] }
 ```
 
 ```rust
@@ -24,6 +24,18 @@ The `grpc` feature is separate: it exports telemetry over OTLP/gRPC.
 Each call gets a SERVER span named `package.Service/Method`, joined to the caller's trace. The span ends with the response body, because a successful call reports its status in trailers. A streaming call lasts as long as its stream, and a client that hangs up reads as `CANCELLED`. `rpc.server.call.duration` measures the same span.
 
 Only codes that are the server's fault (`INTERNAL`, `UNAVAILABLE` and so on) mark the span as an error and set `error.type`.
+
+## Calling a gRPC service
+
+Wrap the channel, and every call through it gets a CLIENT span and carries `traceparent` and `baggage` to the server:
+
+```rust,ignore
+let endpoint = Channel::from_static("http://[::1]:50051");
+let channel = endpoint.connect().await?;
+let mut client = GreeterClient::new(autotel::tonic::client(channel).server(endpoint.uri()));
+```
+
+`.server(..)` names the endpoint as `server.address` and `server.port`. A `Channel` adds its address after the request leaves the wrapper, so the span can't see it otherwise. The span records `rpc.method` and `rpc.status_code`, stays open until the trailers arrive, and feeds `rpc.client.call.duration`, which carries the same `server.address` and `server.port`. On the client every code other than `OK` is an error, as the conventions say. An error from the channel goes through tonic's own `Status::from_error`, and the wrapper returns that `Status`, so the span records the code the caller gets: `UNAVAILABLE` for a server it can't reach, `CANCELLED` for a channel timeout. For `tower::ServiceBuilder`, use `autotel::tonic::client_layer()`.
 
 ## Method names
 

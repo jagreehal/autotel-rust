@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- `autotel::tonic::client(channel)` records gRPC CLIENT spans and `rpc.client.call.duration` with `server.address` and `server.port`, sends `traceparent` and `baggage`, and returns tonic's own `Status` for channel and body errors.
+- `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=console` prints a signal to stdout with the `console` feature. Console traces follow the tail sampler.
+- `counter_with`, `histogram_with`, `up_down_counter_with`, `gauge` and `gauge_with` record with attributes. `observe_gauge`, `observe_counter` and `observe_up_down_counter` read a value at each export. `autotel::Counter` and `autotel::Histogram` name the instrument types.
+- `AutotelConfig::otlp_headers` sends credentials from code, and `AutotelConfig::redact_keys` extends `redact_pii`.
+- `database_result`, `TraceContext::record_exception` (error type and cause chain) and `install_panic_hook()` record failures on spans.
+- A `trace` span that a panic or a dropped future ends reaches `TraceCollector` as a failure, with `error.type` `panic` or `cancelled`.
+- With metrics off, `init` installs a no-op meter provider.
+- `migrate/` ports the opentelemetry-rust examples to autotel, with a migration guide in the docs.
+
 ## 0.2.1
 
 - `TraceCollector` works in parallel tests. `new` waits for the open collector to drop, so each test sees only its own spans.

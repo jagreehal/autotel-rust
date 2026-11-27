@@ -1,0 +1,28 @@
+[package]
+name = "migrate"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "The opentelemetry-rust examples, rewritten with autotel"
+
+[dependencies]
+anyhow = "1.0.104"
+autotel = { path = "..", features = ["axum", "console", "tonic"] }
+axum = "0.8.9"
+prost = "0.14"
+tokio = { version = "1.54.1", features = ["full"] }
+tonic = "0.14.6"
+tonic-prost = "0.14"
+tracing = "0.1.44"
+
+[build-dependencies]
+# A bundled protoc, so the workspace builds without one installed.
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

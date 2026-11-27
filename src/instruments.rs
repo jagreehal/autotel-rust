@@ -26,6 +26,8 @@ pub(crate) struct Instruments {
     pub http_client_duration: Histogram<f64>,
     #[cfg(feature = "tonic")]
     pub rpc_server_duration: Histogram<f64>,
+    #[cfg(feature = "tonic")]
+    pub rpc_client_duration: Histogram<f64>,
     pub db_operation_duration: Histogram<f64>,
     #[cfg_attr(not(feature = "sqlx"), allow(dead_code))]
     pub db_connection_wait_time: Histogram<f64>,
@@ -56,6 +58,13 @@ impl Instruments {
                 .f64_histogram("rpc.server.call.duration")
                 .with_unit("s")
                 .with_description("Duration of inbound RPCs")
+                .with_boundaries(GRPC_DURATION_BOUNDARIES.to_vec())
+                .build(),
+            #[cfg(feature = "tonic")]
+            rpc_client_duration: global::meter(INSTRUMENTATION_NAME)
+                .f64_histogram("rpc.client.call.duration")
+                .with_unit("s")
+                .with_description("Duration of outbound RPCs")
                 .with_boundaries(GRPC_DURATION_BOUNDARIES.to_vec())
                 .build(),
             db_operation_duration: seconds_histogram(
@@ -140,10 +149,12 @@ pub(crate) fn record_http_server(
 
 /// `method` must be bounded: `_OTHER` for one the server doesn't recognise.
 #[cfg(feature = "tonic")]
-pub(crate) fn record_rpc_server(
+pub(crate) fn record_rpc(
+    client: bool,
     method: &str,
     status: &'static str,
     failed: bool,
+    server: Option<&(String, Option<u16>)>,
     elapsed: Duration,
 ) {
     let mut attrs = vec![
@@ -151,10 +162,23 @@ pub(crate) fn record_rpc_server(
         KeyValue::new("rpc.method", method.to_owned()),
         KeyValue::new("rpc.status_code", status),
     ];
+    if let Some((address, port)) = server {
+        attrs.push(KeyValue::new("server.address", address.clone()));
+        if let Some(port) = port {
+            attrs.push(KeyValue::new("server.port", i64::from(*port)));
+        }
+    }
     if failed {
         attrs.push(KeyValue::new("error.type", status));
     }
-    with(|i| i.rpc_server_duration.record(elapsed.as_secs_f64(), &attrs));
+    with(|i| {
+        let histogram = if client {
+            &i.rpc_client_duration
+        } else {
+            &i.rpc_server_duration
+        };
+        histogram.record(elapsed.as_secs_f64(), &attrs);
+    });
 }
 
 pub(crate) fn record_http_client(method: &str, url: &str, span: &SpanData, elapsed: Duration) {

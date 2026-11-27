@@ -334,6 +334,47 @@ fn exporter_none_silences_one_signal_and_leaves_the_others() {
     assert!(!traces_only.contains("/v1/logs"), "{traces_only}");
 }
 
+#[cfg(not(feature = "console"))]
+#[test]
+fn exporter_console_without_the_feature_fails_init() {
+    let test = "exporter_console_without_the_feature_fails_init";
+    if let Some(passed) = in_child(test, &[("OTEL_LOGS_EXPORTER", "console")]) {
+        assert!(passed);
+        return;
+    }
+    let error = autotel::init(AutotelConfig::new("x")).err().unwrap();
+    assert!(error.to_string().contains("`console` feature"), "{error}");
+}
+
+#[cfg(feature = "console")]
+#[test]
+fn exporter_console_prints_that_signal_instead_of_exporting_it() {
+    if std::env::var_os("AUTOTEL_ENV_CHILD").is_some() {
+        log_inside_a_span(AutotelConfig::new("x"));
+        return;
+    }
+    let test = "exporter_console_prints_that_signal_instead_of_exporting_it";
+    let exported = exported_paths(
+        test,
+        &[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "{endpoint}"),
+            ("OTEL_TRACES_EXPORTER", "console"),
+        ],
+    );
+    assert!(!exported.contains("/v1/traces"), "{exported}");
+    assert!(exported.contains("/v1/metrics"), "{exported}");
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("AUTOTEL_ENV_CHILD", "1")
+        .env("OTEL_TRACES_EXPORTER", "console")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Name         : work"), "{stdout}");
+}
+
 #[test]
 fn one_per_signal_endpoint_exports_that_signal_alone() {
     if std::env::var_os("AUTOTEL_ENV_CHILD").is_some() {
@@ -377,4 +418,39 @@ fn keeping_one_log_file_fails_init_because_rotation_would_delete_it() {
     let error = autotel::init(config).err().unwrap().to_string();
 
     assert!(error.contains("max_files"), "{error}");
+}
+
+struct CountInstrumentFailures(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountInstrumentFailures {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().name() == "InstrumentCreationFailed" {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn metrics_off_accepts_observable_instruments_quietly() {
+    let env = [
+        ("OTEL_METRICS_EXPORTER", "none"),
+        ("OTEL_TRACES_EXPORTER", "none"),
+        ("OTEL_LOGS_EXPORTER", "none"),
+    ];
+    if let Some(ok) = in_child("metrics_off_accepts_observable_instruments_quietly", &env) {
+        assert!(ok);
+        return;
+    }
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _subscriber = tracing_subscriber::registry()
+        .with(CountInstrumentFailures(std::sync::Arc::clone(&failures)))
+        .set_default();
+    let _telemetry = autotel::init(AutotelConfig {
+        otlp_endpoint: Some("http://127.0.0.1:4318".into()),
+        ..AutotelConfig::new("metrics-off")
+    })
+    .unwrap();
+    autotel::observe_gauge("queue.depth", "{item}", &[], || 1.0);
+    assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

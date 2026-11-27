@@ -1,5 +1,5 @@
-//! `rpc.server.call.duration`. One test, because `init` and the global meter provider
-//! are process-wide.
+//! `rpc.server.call.duration` and `rpc.client.call.duration`. One test, because
+//! `init` and the global meter provider are process-wide.
 
 #![cfg(feature = "tonic")]
 
@@ -66,24 +66,37 @@ async fn rejected(path: &str) {
         .unwrap();
 }
 
-fn points(exporter: &InMemoryMetricExporter) -> Vec<(Labels, u64, Vec<f64>)> {
+/// A client call through `autotel::tonic::client` to `server`.
+async fn client_call(server: &'static str) {
+    let service = service_fn(|_| async { Ok::<_, Infallible>(http::Response::new(finished("0"))) });
+    let request = http::Request::builder()
+        .uri("/orders.Orders/Get")
+        .body(())
+        .unwrap();
+    let response = autotel::tonic::client(service)
+        .server(&http::Uri::from_static(server))
+        .oneshot(request)
+        .await
+        .unwrap();
+    response.into_body().collect().await.unwrap();
+}
+
+fn points(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(Labels, u64, Vec<f64>)> {
     let mut points = Vec::new();
     for resource in exporter.get_finished_metrics().unwrap() {
-        for scope in resource.scope_metrics() {
-            for metric in scope.metrics() {
-                let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
-                    continue;
-                };
-                assert_eq!(metric.name(), "rpc.server.call.duration");
-                assert_eq!(metric.unit(), "s");
-                for point in histogram.data_points() {
-                    let labels = point
-                        .attributes()
-                        .map(|kv| (kv.key.to_string(), kv.value.to_string()))
-                        .collect();
-                    points.push((labels, point.count(), point.bounds().collect()));
-                }
-            }
+        let metrics = resource.scope_metrics().flat_map(|scope| scope.metrics());
+        for metric in metrics.filter(|metric| metric.name() == name) {
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                continue;
+            };
+            assert_eq!(metric.unit(), "s");
+            points.extend(histogram.data_points().map(|point| {
+                let labels = point
+                    .attributes()
+                    .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                    .collect();
+                (labels, point.count(), point.bounds().collect())
+            }));
         }
     }
     points
@@ -105,9 +118,29 @@ async fn calls_are_measured_by_method_and_status_and_unknown_methods_share_a_ser
     call("/scan.Me/One", "12").await;
     call("/scan.Me/Two", "12").await;
     rejected("/scan.Me/Three").await;
+    client_call("http://orders-a:50051").await;
+    client_call("https://orders-b").await;
     provider.force_flush().unwrap();
 
-    let points = points(&exporter);
+    // Calls to different destinations stay in their own series.
+    let clients = points(&exporter, "rpc.client.call.duration");
+    let destinations: Vec<_> = clients
+        .iter()
+        .map(|(labels, _, _)| {
+            (
+                labels["server.address"].as_str(),
+                labels["server.port"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(destinations.len(), 2, "{clients:#?}");
+    assert!(
+        destinations.contains(&("orders-a", "50051")),
+        "{clients:#?}"
+    );
+    assert!(destinations.contains(&("orders-b", "443")), "{clients:#?}");
+
+    let points = points(&exporter, "rpc.server.call.duration");
     let find = |method: &str, status: &str| {
         points
             .iter()

@@ -60,8 +60,17 @@ pub mod axum {
 
 #[cfg(feature = "tonic")]
 pub mod tonic {
-    //! Tower layer that records gRPC SERVER spans for tonic services.
-    pub use crate::tonic_layer::{AutotelLayer, AutotelMiddleware, TracedBody, layer};
+    //! Tower layers that record gRPC SERVER spans for tonic services and CLIENT
+    //! spans for tonic clients.
+    pub use crate::tonic_layer::{
+        AutotelLayer, AutotelMiddleware, ClientLayer, ClientMiddleware, StatusBody, TracedBody,
+        client, client_layer, layer,
+    };
 }
 
-pub use opentelemetry::{KeyValue, context::FutureExt, trace::SpanKind};
+pub use opentelemetry::{
+    KeyValue,
+    context::FutureExt,
+    metrics::{Counter, Histogram},
+    trace::SpanKind,
+};

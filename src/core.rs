@@ -6,19 +6,21 @@ use opentelemetry::{
     global,
     trace::{SpanKind, Status, TraceContextExt, Tracer},
 };
-use opentelemetry_otlp::{Protocol, WithExportConfig};
+#[cfg(feature = "grpc")]
+use opentelemetry_otlp::WithTonicConfig;
+use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     Resource,
     logs::SdkLoggerProvider,
     metrics::SdkMeterProvider,
     resource::{EnvResourceDetector, TelemetryResourceDetector},
-    trace::{BatchSpanProcessor, SdkTracerProvider},
+    trace::{BatchSpanProcessor, SdkTracerProvider, SpanProcessor},
 };
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     sync::{
         Arc, LazyLock, Mutex, RwLock,
@@ -65,7 +67,17 @@ impl OtlpProtocol {
 
 /// The spec's way to silence one signal, for backends that take only some of them.
 fn exporter_off(key: &str) -> bool {
-    env_value(key).as_deref() == Some("none")
+    matches!(env_value(key).as_deref(), Some("none" | "console"))
+}
+
+/// `console`, the spec's value for printing one signal to stdout instead of exporting it.
+fn exporter_console(key: &str) -> anyhow::Result<bool> {
+    let console = env_value(key).as_deref() == Some("console");
+    anyhow::ensure!(
+        cfg!(feature = "console") || !console,
+        "{key}=console needs the autotel `console` feature"
+    );
+    Ok(console)
 }
 
 pub(crate) fn env_value(key: &str) -> Option<String> {
@@ -133,6 +145,12 @@ pub struct AutotelConfig {
     /// `password=…` pairs inside messages and other text. Pattern-based: keep PII in
     /// named fields where you can.
     pub redact_pii: bool,
+    /// More key fragments to redact, matched case-insensitively anywhere in the key,
+    /// as `email` is. Set with [`AutotelConfig::redact_keys`].
+    pub redact_keys: Vec<String>,
+    /// Headers sent with every OTLP export, such as an API key.
+    /// `OTEL_EXPORTER_OTLP_HEADERS` wins over a header with the same name.
+    pub otlp_headers: HashMap<String, String>,
     /// Keep a copy of the last 10,000 finished spans in memory for [`completed_spans`],
     /// [`crate::TraceCollector`] and the embedded [`crate::Devtools`]. Off by default:
     /// in production it costs a copy and a lock per span for nothing.
@@ -273,6 +291,35 @@ impl AutotelConfig {
     #[must_use]
     pub fn grpc(mut self) -> Self {
         self.otlp_protocol = OtlpProtocol::Grpc;
+        self
+    }
+
+    /// Redact values under keys containing any of `fragments` too, such as
+    /// `["authorization", "username"]`. Turns on [`AutotelConfig::redact_pii`].
+    #[must_use]
+    pub fn redact_keys<S: Into<String>>(mut self, fragments: impl IntoIterator<Item = S>) -> Self {
+        let fragments = fragments
+            .into_iter()
+            .map(|fragment| fragment.into().trim().to_ascii_lowercase());
+        // An empty fragment would match every key.
+        self.redact_keys
+            .extend(fragments.filter(|fragment| !fragment.is_empty()));
+        self.redact_pii = true;
+        self
+    }
+
+    /// Send these headers with every OTLP export, such as `[("api-key", key)]`.
+    /// A name or value that isn't a valid header fails [`init`].
+    #[must_use]
+    pub fn otlp_headers<K: Into<String>, V: Into<String>>(
+        mut self,
+        headers: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        self.otlp_headers.extend(
+            headers
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
         self
     }
 
@@ -538,19 +585,67 @@ impl TraceContext {
     }
 
     pub fn record_error(&self, error: &dyn std::fmt::Display) {
-        let message = error.to_string();
+        self.record_failure(error.to_string(), None);
+    }
+
+    /// [`TraceContext::record_error`] for a `std::error::Error`: the message carries the
+    /// `source()` chain as `outer: inner`, and `exception.type` and `error.type` name
+    /// the error's type. For `anyhow::Error`, pass `error.as_ref()` (the type is then unknown).
+    pub fn record_exception<E: std::error::Error + ?Sized>(&self, error: &E) {
+        let mut message = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        let kind = std::any::type_name::<E>();
+        let kind = (!kind.starts_with("dyn ")).then_some(kind);
+        if let Some(kind) = kind {
+            self.set_attribute("error.type", kind);
+        }
+        self.record_failure(message, kind);
+    }
+
+    /// Marks the span failed, keeping an `error.type` and exception it already has, so a
+    /// failure that several layers report shows once.
+    pub(crate) fn fail_once(&self, message: String, kind: &str) {
+        let (has_error, has_type) = {
+            let span = self.inner.lock().expect("span mutex");
+            (
+                span.error.is_some(),
+                span.attributes.contains_key("error.type"),
+            )
+        };
+        if !has_type {
+            self.set_attribute("error.type", kind);
+        }
+        if !has_error {
+            self.record_failure(message, Some(kind));
+        }
+    }
+
+    fn record_failure(&self, message: String, kind: Option<&str>) {
+        let mut attributes = vec![("exception.message", message.clone())];
+        if let Some(kind) = kind {
+            attributes.push(("exception.type", kind.to_owned()));
+        }
         let mut span = self.inner.lock().expect("span mutex");
         span.error = Some(message.clone());
         span.events.push(SpanEvent {
             name: "exception".into(),
-            attributes: BTreeMap::from([(
-                "exception.message".into(),
-                Value::String(message.clone()),
-            )]),
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).into(), Value::String(value.clone())))
+                .collect(),
         });
+        drop(span);
         self.otel.span().add_event(
             "exception",
-            vec![KeyValue::new("exception.message", message.clone())],
+            attributes
+                .into_iter()
+                .map(|(key, value)| KeyValue::new(key, value))
+                .collect(),
         );
         self.otel.span().set_status(Status::error(message));
     }
@@ -579,6 +674,7 @@ impl Default for RuntimeState {
 /// Settings read on every span, kept out of the runtime mutex so concurrent spans
 /// don't serialise on one lock. Written only by `init`.
 pub(crate) static REDACT_PII: AtomicBool = AtomicBool::new(false);
+static REDACT_KEYS: RwLock<Vec<String>> = RwLock::new(Vec::new());
 static CAPTURE_SPANS: AtomicBool = AtomicBool::new(false);
 type SpanSettings = (Option<String>, Option<Arc<dyn crate::TailSampler>>);
 static SPAN_SETTINGS: RwLock<SpanSettings> = RwLock::new((None, None));
@@ -635,6 +731,11 @@ impl Drop for AutotelRuntime {
 
 pub fn init(mut config: AutotelConfig) -> anyhow::Result<AutotelRuntime> {
     env_protocol()?;
+    let console = [
+        ("traces", exporter_console("OTEL_TRACES_EXPORTER")?),
+        ("metrics", exporter_console("OTEL_METRICS_EXPORTER")?),
+        ("logs", exporter_console("OTEL_LOGS_EXPORTER")?),
+    ];
     let resource = config.resource();
     let service = resource
         .get(&opentelemetry::Key::from_static_str("service.name"))
@@ -649,46 +750,41 @@ pub fn init(mut config: AutotelConfig) -> anyhow::Result<AutotelRuntime> {
     if log_file.is_some() {
         config.install_tracing_subscriber = true;
     }
-    let mut builder = SdkTracerProvider::builder().with_resource(resource.clone());
-    let mut meter_builder = SdkMeterProvider::builder().with_resource(resource.clone());
-    let mut logger_builder = SdkLoggerProvider::builder()
-        .with_resource(resource)
-        .with_log_processor(crate::logs::StampTimestamp);
     let endpoints = config.signal_endpoints();
     let protocol = endpoints.protocol;
     let enabled = |endpoint: Option<String>, key| endpoint.filter(|_| !exporter_off(key));
     let traces = enabled(endpoints.traces, "OTEL_TRACES_EXPORTER");
     let metrics = enabled(endpoints.metrics, "OTEL_METRICS_EXPORTER");
     let logs = enabled(endpoints.logs, "OTEL_LOGS_EXPORTER");
-    let timeout = Duration::from_secs(5);
-    if let Some(endpoint) = &traces {
-        // Redact on the way out so spans that skip `set_attribute` (the `tracing`
-        // bridge, raw OTel API calls) honour `redact_pii` too.
-        let batch = RedactPiiProcessor(
-            BatchSpanProcessor::builder(build_span_exporter(endpoint, protocol, timeout)?).build(),
-        );
-        builder = match &config.sampler {
-            Some(sampler) => builder.with_span_processor(crate::TailSamplingProcessor::new(
-                batch,
-                Arc::clone(sampler),
-            )),
-            None => builder.with_span_processor(batch),
-        };
-    }
-    if let Some(endpoint) = &metrics {
-        meter_builder = meter_builder
-            .with_periodic_exporter(build_metric_exporter(endpoint, protocol, timeout)?);
-    }
-    if let Some(endpoint) = &logs {
-        logger_builder = logger_builder
-            .with_log_processor(crate::logs::RedactPii)
-            .with_batch_exporter(build_log_exporter(endpoint, protocol, timeout)?);
-    }
+    header_map(&config.otlp_headers)?;
+    let builders = (
+        SdkTracerProvider::builder().with_resource(resource.clone()),
+        SdkMeterProvider::builder().with_resource(resource.clone()),
+        SdkLoggerProvider::builder()
+            .with_resource(resource)
+            .with_log_processor(crate::logs::StampTimestamp),
+    );
+    let mut span_processors = Vec::new();
+    let builders = add_otlp_exporters(
+        builders,
+        &config,
+        [&traces, &metrics, &logs],
+        protocol,
+        &mut span_processors,
+    )?;
+    let (builder, meter_builder, logger_builder) =
+        add_console_exporters(builders, console.map(|(_, on)| on), &mut span_processors);
+    let builder = add_span_processors(builder, span_processors, config.sampler.as_ref());
     let provider = builder.build();
-    let meter_provider = meter_builder.build();
+    // No reader means nothing would read observable callbacks, and the SDK logs an
+    // error for each one; the no-op provider accepts them silently.
+    let meter_provider = (metrics.is_some() || console[1].1).then(|| meter_builder.build());
     let logger_provider = logger_builder.build();
     global::set_tracer_provider(provider.clone());
-    global::set_meter_provider(meter_provider.clone());
+    match &meter_provider {
+        Some(provider) => global::set_meter_provider(provider.clone()),
+        None => global::set_meter_provider(opentelemetry::metrics::NoopMeterProvider::new()),
+    }
     // Instruments bind to the provider current when they are built; rebuild them
     // against this one so metrics recorded before (or across) `init` aren't lost.
     crate::instruments::reset();
@@ -697,6 +793,10 @@ pub fn init(mut config: AutotelConfig) -> anyhow::Result<AutotelRuntime> {
     let console_logs = !config.no_console_logs;
     let capturing = config.capture_spans;
     REDACT_PII.store(config.redact_pii, Ordering::Relaxed);
+    REDACT_KEYS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone_from(&config.redact_keys);
     CAPTURE_SPANS.store(config.capture_spans, Ordering::Relaxed);
     *SPAN_SETTINGS.write().unwrap_or_else(|e| e.into_inner()) =
         (config.baggage_prefix.clone(), config.sampler.clone());
@@ -707,50 +807,21 @@ pub fn init(mut config: AutotelConfig) -> anyhow::Result<AutotelRuntime> {
     *state = RuntimeState {
         config,
         provider: Some(provider),
-        meter_provider: Some(meter_provider),
+        meter_provider,
         logger_provider: Some(logger_provider),
         log_file_guard,
     };
     drop(state);
     if install_subscriber {
-        let (writer, guard) =
-            log_file.map_or((None, None), |(writer, guard)| (Some(writer), guard));
-        let wants_file = writer.is_some();
-        let installed = install_default_tracing_subscriber(json_logs, console_logs, writer);
-        if wants_file && !installed {
-            eprintln!(
-                "[autotel] a tracing subscriber is already set, so logs won't reach the log file"
-            );
-        }
-        if installed {
-            let mut state = runtime().lock().expect("runtime mutex");
-            let replaced = std::mem::replace(&mut state.log_file_guard, guard);
-            drop(state);
-            drop(replaced);
-        }
+        install_subscriber_with_log_file(json_logs, console_logs, log_file);
     }
-    let exported = [("traces", &traces), ("metrics", &metrics), ("logs", &logs)];
-    let exported: Vec<_> = exported
-        .into_iter()
-        .filter_map(|(signal, endpoint)| {
-            let url = crate::instrumentation::redact_url(endpoint.as_ref()?);
-            Some(format!("{signal} to {url}"))
-        })
-        .collect();
-    if !exported.is_empty() {
-        tracing::info!(
-            target: "autotel",
-            "{service}: exporting {} over {}",
-            exported.join(", "),
-            protocol.name(),
-        );
-    } else if !capturing {
-        tracing::info!(
-            target: "autotel",
-            "{service}: no OTLP endpoint, telemetry stays local. \
-             Set OTEL_EXPORTER_OTLP_ENDPOINT to export"
-        );
-    }
+    log_destinations(
+        &service,
+        [&traces, &metrics, &logs],
+        console,
+        protocol,
+        capturing,
+    );
     Ok(AutotelRuntime(()))
 }
 
@@ -921,10 +992,223 @@ fn http_protocol(protocol: OtlpProtocol) -> Protocol {
     }
 }
 
+type ProviderBuilders = (
+    opentelemetry_sdk::trace::TracerProviderBuilder,
+    opentelemetry_sdk::metrics::MeterProviderBuilder,
+    opentelemetry_sdk::logs::LoggerProviderBuilder,
+);
+
+/// An OTLP exporter for each signal that has an endpoint.
+fn add_otlp_exporters(
+    (traces_builder, mut metrics_builder, mut logs_builder): ProviderBuilders,
+    config: &AutotelConfig,
+    [traces, metrics, logs]: [&Option<String>; 3],
+    protocol: OtlpProtocol,
+    span_processors: &mut Vec<Box<dyn SpanProcessor>>,
+) -> anyhow::Result<ProviderBuilders> {
+    let timeout = Duration::from_secs(5);
+    let headers = &config.otlp_headers;
+    if let Some(endpoint) = traces {
+        // Redact on the way out so spans that skip `set_attribute` (the `tracing`
+        // bridge, raw OTel API calls) honour `redact_pii` too.
+        span_processors.push(Box::new(RedactPiiProcessor(
+            BatchSpanProcessor::builder(build_span_exporter(endpoint, protocol, timeout, headers)?)
+                .build(),
+        )));
+    }
+    if let Some(endpoint) = metrics {
+        metrics_builder = metrics_builder
+            .with_periodic_exporter(build_metric_exporter(endpoint, protocol, timeout, headers)?);
+    }
+    if let Some(endpoint) = logs {
+        logs_builder = logs_builder
+            .with_log_processor(crate::logs::RedactPii)
+            .with_batch_exporter(build_log_exporter(endpoint, protocol, timeout, headers)?);
+    }
+    Ok((traces_builder, metrics_builder, logs_builder))
+}
+
+/// A stdout exporter for each signal set to `console` (traces, metrics, logs).
+#[cfg(feature = "console")]
+fn add_console_exporters(
+    (traces_builder, mut metrics_builder, mut logs_builder): ProviderBuilders,
+    [traces, metrics, logs]: [bool; 3],
+    span_processors: &mut Vec<Box<dyn SpanProcessor>>,
+) -> ProviderBuilders {
+    if traces {
+        span_processors.push(Box::new(RedactPiiProcessor(
+            opentelemetry_sdk::trace::SimpleSpanProcessor::new(
+                opentelemetry_stdout::SpanExporter::default(),
+            ),
+        )));
+    }
+    if metrics {
+        metrics_builder =
+            metrics_builder.with_periodic_exporter(opentelemetry_stdout::MetricExporter::default());
+    }
+    if logs {
+        logs_builder = logs_builder
+            .with_log_processor(crate::logs::RedactPii)
+            .with_simple_exporter(opentelemetry_stdout::LogExporter::default());
+    }
+    (traces_builder, metrics_builder, logs_builder)
+}
+
+/// Every exporting processor behind one tail sampler, so OTLP and stdout keep the
+/// same traces.
+fn add_span_processors(
+    builder: opentelemetry_sdk::trace::TracerProviderBuilder,
+    processors: Vec<Box<dyn SpanProcessor>>,
+    sampler: Option<&Arc<dyn crate::TailSampler>>,
+) -> opentelemetry_sdk::trace::TracerProviderBuilder {
+    if processors.is_empty() {
+        return builder;
+    }
+    let fanout = Fanout(processors);
+    match sampler {
+        Some(sampler) => builder.with_span_processor(crate::TailSamplingProcessor::new(
+            fanout,
+            Arc::clone(sampler),
+        )),
+        None => builder.with_span_processor(fanout),
+    }
+}
+
+/// Hands each span to every processor in turn.
+#[derive(Debug)]
+struct Fanout(Vec<Box<dyn SpanProcessor>>);
+
+impl SpanProcessor for Fanout {
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &Context) {
+        for processor in &self.0 {
+            processor.on_start(span, cx);
+        }
+    }
+
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        for processor in &self.0 {
+            processor.on_end(span.clone());
+        }
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0
+            .iter()
+            .map(|processor| processor.force_flush())
+            .fold(Ok(()), Result::and)
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0
+            .iter()
+            .map(|processor| processor.shutdown_with_timeout(timeout))
+            .fold(Ok(()), Result::and)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        for processor in &mut self.0 {
+            processor.set_resource(resource);
+        }
+    }
+}
+
+/// `exporter_console` has already failed `init` if any signal asked for `console`.
+#[cfg(not(feature = "console"))]
+fn add_console_exporters(
+    builders: ProviderBuilders,
+    _: [bool; 3],
+    _: &mut Vec<Box<dyn SpanProcessor>>,
+) -> ProviderBuilders {
+    builders
+}
+
+fn install_subscriber_with_log_file(
+    json_logs: bool,
+    console_logs: bool,
+    log_file: Option<(
+        tracing_subscriber::fmt::writer::BoxMakeWriter,
+        Option<tracing_appender::non_blocking::WorkerGuard>,
+    )>,
+) {
+    let (writer, guard) = log_file.map_or((None, None), |(writer, guard)| (Some(writer), guard));
+    let wants_file = writer.is_some();
+    let installed = install_default_tracing_subscriber(json_logs, console_logs, writer);
+    if wants_file && !installed {
+        eprintln!(
+            "[autotel] a tracing subscriber is already set, so logs won't reach the log file"
+        );
+    }
+    if installed {
+        let mut state = runtime().lock().expect("runtime mutex");
+        let replaced = std::mem::replace(&mut state.log_file_guard, guard);
+        drop(state);
+        drop(replaced);
+    }
+}
+
+/// The `init` log line naming where each signal goes.
+fn log_destinations(
+    service: &str,
+    [traces, metrics, logs]: [&Option<String>; 3],
+    console: [(&str, bool); 3],
+    protocol: OtlpProtocol,
+    capturing: bool,
+) {
+    let exported: Vec<_> = [("traces", traces), ("metrics", metrics), ("logs", logs)]
+        .into_iter()
+        .filter_map(|(signal, endpoint)| {
+            let url = crate::instrumentation::redact_url(endpoint.as_ref()?);
+            Some(format!("{signal} to {url}"))
+        })
+        .collect();
+    let printed: Vec<_> = console
+        .into_iter()
+        .filter_map(|(signal, on)| on.then_some(signal))
+        .collect();
+    if !printed.is_empty() {
+        tracing::info!(target: "autotel", "{service}: printing {} to stdout", printed.join(", "));
+    }
+    if !exported.is_empty() {
+        tracing::info!(
+            target: "autotel",
+            "{service}: exporting {} over {}",
+            exported.join(", "),
+            protocol.name(),
+        );
+    } else if !capturing && printed.is_empty() {
+        tracing::info!(
+            target: "autotel",
+            "{service}: no OTLP endpoint, telemetry stays local. \
+             Set OTEL_EXPORTER_OTLP_ENDPOINT to export"
+        );
+    }
+}
+
+/// `otlp_headers` as an `http::HeaderMap`, so a bad name or value fails `init`.
+fn header_map(headers: &HashMap<String, String>) -> anyhow::Result<http::HeaderMap> {
+    let mut map = http::HeaderMap::new();
+    for (key, value) in headers {
+        let name = http::HeaderName::try_from(key.as_str())
+            .map_err(|error| anyhow::anyhow!("OTLP header name {key:?}: {error}"))?;
+        let value = http::HeaderValue::try_from(value.as_str())
+            .map_err(|error| anyhow::anyhow!("OTLP header {key}: {error}"))?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+#[cfg(feature = "grpc")]
+fn grpc_metadata(
+    headers: &HashMap<String, String>,
+) -> anyhow::Result<opentelemetry_otlp::tonic_types::metadata::MetadataMap> {
+    Ok(opentelemetry_otlp::tonic_types::metadata::MetadataMap::from_headers(header_map(headers)?))
+}
+
 fn build_span_exporter(
     endpoint: &str,
     protocol: OtlpProtocol,
     timeout: Duration,
+    headers: &HashMap<String, String>,
 ) -> anyhow::Result<opentelemetry_otlp::SpanExporter> {
     match protocol {
         OtlpProtocol::HttpJson | OtlpProtocol::HttpProtobuf => {
@@ -933,6 +1217,7 @@ fn build_span_exporter(
                 .with_protocol(http_protocol(protocol))
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
+                .with_headers(headers.clone())
                 .build()?)
         }
         #[cfg(feature = "grpc")]
@@ -940,6 +1225,7 @@ fn build_span_exporter(
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(timeout)
+            .with_metadata(grpc_metadata(headers)?)
             .build()?),
     }
 }
@@ -948,6 +1234,7 @@ fn build_metric_exporter(
     endpoint: &str,
     protocol: OtlpProtocol,
     timeout: Duration,
+    headers: &HashMap<String, String>,
 ) -> anyhow::Result<opentelemetry_otlp::MetricExporter> {
     match protocol {
         OtlpProtocol::HttpJson | OtlpProtocol::HttpProtobuf => {
@@ -956,6 +1243,7 @@ fn build_metric_exporter(
                 .with_protocol(http_protocol(protocol))
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
+                .with_headers(headers.clone())
                 .build()?)
         }
         #[cfg(feature = "grpc")]
@@ -963,6 +1251,7 @@ fn build_metric_exporter(
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(timeout)
+            .with_metadata(grpc_metadata(headers)?)
             .build()?),
     }
 }
@@ -971,6 +1260,7 @@ fn build_log_exporter(
     endpoint: &str,
     protocol: OtlpProtocol,
     timeout: Duration,
+    headers: &HashMap<String, String>,
 ) -> anyhow::Result<opentelemetry_otlp::LogExporter> {
     match protocol {
         OtlpProtocol::HttpJson | OtlpProtocol::HttpProtobuf => {
@@ -979,6 +1269,7 @@ fn build_log_exporter(
                 .with_protocol(http_protocol(protocol))
                 .with_endpoint(endpoint)
                 .with_timeout(timeout)
+                .with_headers(headers.clone())
                 .build()?)
         }
         #[cfg(feature = "grpc")]
@@ -986,6 +1277,7 @@ fn build_log_exporter(
             .with_tonic()
             .with_endpoint(endpoint)
             .with_timeout(timeout)
+            .with_metadata(grpc_metadata(headers)?)
             .build()?),
     }
 }
@@ -1007,12 +1299,45 @@ where
     // The active span travels with the future via the OTel Context, not the thread,
     // so concurrent and work-stolen tasks keep their own parents. The parent may
     // also be remote: a span context extracted from another service's headers.
-    let open = open_span(name.into(), kind, &Context::current());
-    let output = work(open.context.clone())
-        .with_context(open.scope.clone())
+    let mut open = FinishOnDrop {
+        span: Some(open_span(name.into(), kind, &Context::current())),
+        completed: false,
+    };
+    let Some(span) = &open.span else {
+        unreachable!("set on the line above")
+    };
+    let output = work(span.context.clone())
+        .with_context(span.scope.clone())
         .await;
-    open.finish();
+    open.completed = true;
     output
+}
+
+/// Finishes the span when `trace_kind`'s future completes, panics or is dropped, so
+/// `completed_spans` and `TraceCollector` see spans a panic or a timeout cut short.
+/// Those spans end as failures, with `error.type` `panic` or `cancelled`.
+struct FinishOnDrop {
+    span: Option<OpenSpan>,
+    completed: bool,
+}
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        if let Some(open) = self.span.take()
+            // A poisoned span lock would panic again in `finish` and abort the process.
+            && !open.context.inner.is_poisoned()
+        {
+            if !self.completed {
+                let (message, kind) = if std::thread::panicking() {
+                    ("panicked", "panic")
+                } else {
+                    ("cancelled before it finished", "cancelled")
+                };
+                open.context.fail_once(message.into(), kind);
+            }
+            open.finish();
+        }
+    }
 }
 
 /// A started span that nothing has ended yet. [`trace_kind`] ends it when its closure
@@ -1200,6 +1525,27 @@ pub fn current_context() -> Option<TraceContext> {
     Context::current().get::<TraceContext>().cloned()
 }
 
+/// Opt-in: log each panic through `tracing` (so it reaches the log exporter) and mark
+/// the active span failed with `error.type = "panic"`, then run the previous hook.
+/// Call once, after [`init`].
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".into());
+        let location = info.location().map(ToString::to_string).unwrap_or_default();
+        if let Some(context) = current_context() {
+            context.fail_once(format!("panicked at {location}: {message}"), "panic");
+        }
+        tracing::error!(target: "autotel", location = %location, "panic: {message}");
+        previous(info);
+    }));
+}
+
 /// Trace id of the active span, for error bodies and support tickets.
 pub fn current_trace_id() -> Option<String> {
     current_context().map(|context| context.trace_id())
@@ -1219,23 +1565,98 @@ pub fn force_keep() {
 }
 
 pub fn counter(name: &str, value: u64) {
+    counter_with(name, value, &[]);
+}
+/// [`counter`] with attributes: `counter_with("orders", 1, &[KeyValue::new("region", "eu")])`.
+pub fn counter_with(name: &str, value: u64, attributes: &[KeyValue]) {
     global::meter(INSTRUMENTATION_NAME)
         .u64_counter(name.to_owned())
         .build()
-        .add(value, &[]);
+        .add(value, attributes);
 }
 pub fn histogram(name: &str, value: f64, unit: &str) {
+    histogram_with(name, value, unit, &[]);
+}
+/// [`histogram`] with attributes.
+pub fn histogram_with(name: &str, value: f64, unit: &str, attributes: &[KeyValue]) {
     global::meter(INSTRUMENTATION_NAME)
         .f64_histogram(name.to_owned())
         .with_unit(unit.to_owned())
         .build()
-        .record(value, &[]);
+        .record(value, attributes);
 }
 pub fn up_down_counter(name: &str, value: i64) {
+    up_down_counter_with(name, value, &[]);
+}
+/// [`up_down_counter`] with attributes.
+pub fn up_down_counter_with(name: &str, value: i64, attributes: &[KeyValue]) {
     global::meter(INSTRUMENTATION_NAME)
         .i64_up_down_counter(name.to_owned())
         .build()
-        .add(value, &[]);
+        .add(value, attributes);
+}
+/// The current value of something, such as a cache hit ratio. The last value
+/// recorded before each export wins.
+pub fn gauge(name: &str, value: f64, unit: &str) {
+    gauge_with(name, value, unit, &[]);
+}
+/// [`gauge`] with attributes.
+pub fn gauge_with(name: &str, value: f64, unit: &str, attributes: &[KeyValue]) {
+    global::meter(INSTRUMENTATION_NAME)
+        .f64_gauge(name.to_owned())
+        .with_unit(unit.to_owned())
+        .build()
+        .record(value, attributes);
+}
+
+/// Read a value at every export, such as a queue's depth:
+/// `observe_gauge("queue.depth", "{item}", &[], move || queue.len() as f64)`.
+/// Register once, after `init`: the callback runs until shutdown.
+///
+/// The callback is synchronous and runs on the export thread. For a value that needs
+/// async I/O (a database count, say), refresh an `AtomicU64` from a task on an interval
+/// and read the atomic here.
+pub fn observe_gauge(
+    name: &str,
+    unit: &str,
+    attributes: &[KeyValue],
+    callback: impl Fn() -> f64 + Send + Sync + 'static,
+) {
+    let attributes = attributes.to_vec();
+    global::meter(INSTRUMENTATION_NAME)
+        .f64_observable_gauge(name.to_owned())
+        .with_unit(unit.to_owned())
+        .with_callback(move |observer| observer.observe(callback(), &attributes))
+        .build();
+}
+/// [`observe_gauge`] for a total that only grows, kept somewhere else (bytes sent,
+/// say). `callback` returns the total, not the change.
+pub fn observe_counter(
+    name: &str,
+    unit: &str,
+    attributes: &[KeyValue],
+    callback: impl Fn() -> u64 + Send + Sync + 'static,
+) {
+    let attributes = attributes.to_vec();
+    global::meter(INSTRUMENTATION_NAME)
+        .u64_observable_counter(name.to_owned())
+        .with_unit(unit.to_owned())
+        .with_callback(move |observer| observer.observe(callback(), &attributes))
+        .build();
+}
+/// [`observe_gauge`] for a total that rises and falls, such as open connections.
+pub fn observe_up_down_counter(
+    name: &str,
+    unit: &str,
+    attributes: &[KeyValue],
+    callback: impl Fn() -> i64 + Send + Sync + 'static,
+) {
+    let attributes = attributes.to_vec();
+    global::meter(INSTRUMENTATION_NAME)
+        .i64_observable_up_down_counter(name.to_owned())
+        .with_unit(unit.to_owned())
+        .with_callback(move |observer| observer.observe(callback(), &attributes))
+        .build();
 }
 
 /// A histogram to record into with attributes. Create it after `init`.
@@ -1364,10 +1785,15 @@ pub(crate) fn pii_key(key: &str) -> bool {
     // secrets; any other `*_tokens` key (`access_tokens`) still is.
     let token_count =
         lower == "tokens" || lower.starts_with("gen_ai.usage.") || lower.ends_with("max_tokens");
-    ["email", "card", "password", "token"]
+    (["email", "card", "password", "token"]
         .iter()
         .any(|part| lower.contains(part))
-        && !token_count
+        && !token_count)
+        || REDACT_KEYS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|part| lower.contains(part.as_str()))
 }
 
 /// Redacts PII inside free text (log messages, string values): email addresses,
