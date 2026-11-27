@@ -139,7 +139,7 @@ Deployments change behaviour through the [standard `OTEL_*` variables](#configur
 ```sh
 cargo add autotel anyhow tracing
 cargo add tokio --features macros,rt-multi-thread
-# optional autotel features: axum, tonic, grpc, sqlx
+# optional autotel features: axum, tonic, grpc, sqlx, console
 ```
 
 ```rust
@@ -178,10 +178,14 @@ INFO orders: order created
 
 The [Rust OpenTelemetry Workshop](workshop/README.md) teaches it in thirteen parts, taking a bank's ATM from `println!` to one trace across three services. Every part runs against a real receiver in CI and checks what arrived.
 
+## Migrating from the SDK
+
+[`migrate/`](migrate/README.md) rewrites the official [opentelemetry-rust examples](https://github.com/open-telemetry/opentelemetry-rust/tree/main/examples) with autotel, one beside the other, and the [migration guide](https://jagreehal.github.io/autotel-rust/migrating/) maps each piece of SDK wiring to what replaces it.
+
 ## Axum
 
 ```toml
-autotel = { version = "0.2", features = ["axum"] }
+autotel = { version = "0.3", features = ["axum"] }
 ```
 
 ```rust
@@ -214,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
 ## gRPC
 
 ```toml
-autotel = { version = "0.2", features = ["tonic"] }
+autotel = { version = "0.3", features = ["tonic"] }
 ```
 
 ```rust,ignore
@@ -228,6 +232,8 @@ tonic::transport::Server::builder()
 Each call gets a SERVER span named `package.Service/Method`, joined to the caller's trace. The span ends with the response body, because a successful call reports its status in trailers, so a streaming call lasts as long as its stream and a client that hangs up reads as `CANCELLED`. `rpc.server.call.duration` measures the same span. Only codes that are the server's fault (`INTERNAL`, `UNAVAILABLE` and so on) mark the span as an error and set `error.type`. An unknown method becomes `rpc.method: _OTHER` on a span named `grpc`, and so does a call a router or middleware answers with plain HTTP. If auth or rate-limit layers answer before tonic routes a call, list your methods with `.methods(["package.Service/Method"])` to keep made-up paths out of span names and metric series.
 
 `client.address` works over plain TCP and TLS, including a TLS stream you accept yourself. Pair autotel with tonic's `tls-aws-lc` feature, which matches its HTTP client. For `tls-ring`, install a provider with `CryptoProvider::install_default`. To serve tonic through an axum router, put the layer on the router and serve it with `into_make_service_with_connect_info::<SocketAddr>()`. Run `cargo run --example tonic --features tonic` to see one trace across a client and server.
+
+Wrap a client's channel with `autotel::tonic::client(channel).server(endpoint.uri())` and each outgoing call gets a CLIENT span, carries `traceparent` and `baggage`, and feeds `rpc.client.call.duration`. Any code other than `OK` marks that span as an error.
 
 The `grpc` feature is separate: it exports telemetry over OTLP/gRPC.
 
@@ -250,11 +256,11 @@ Set the standard variables and change no code. They beat the values in `AutotelC
 | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Turns export on. `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` override one signal. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` (default), `http/protobuf`, or `grpc` with the `grpc` feature. Anything else fails `init`. |
-| `OTEL_EXPORTER_OTLP_HEADERS` | Credentials, as `key=value,key=value`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Credentials, as `key=value,key=value`. In code: `.otlp_headers([("api-key", key)])`. |
 | `OTEL_SERVICE_NAME` | `service.name`. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Any resource attribute, such as `service.version=1.2,deployment.environment.name=prod`. |
 | `OTEL_TRACES_SAMPLER` | Head sampling, such as `parentbased_traceidratio`. |
-| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | `none` silences one signal, for backends like Jaeger that take only traces. |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | `none` silences one signal, for backends like Jaeger that take only traces. `console` prints it to stdout instead, with the `console` feature. |
 | `RUST_LOG` | Log filter for `.with_tracing_subscriber()`. |
 | `AUTOTEL_LOG_FILE_DIR` | Turns on log files in this directory, no code needed. |
 | `AUTOTEL_LOG_FILE_ROTATION` | `minutely`, `hourly`, `daily` (default) or `never`. |
@@ -277,11 +283,11 @@ Use `.json_logs()` in place of `.with_tracing_subscriber()` to print JSON lines 
 - `span_bridge()` puts `#[tracing::instrument]` spans into the same traces as `trace()`, parented both ways. `log_bridge()` links each `tracing` event to its span. `.with_tracing_subscriber()` installs both with a `RUST_LOG` filter that `set_log_filter` changes at runtime.
 - W3C `traceparent` and `baggage` propagation: `inject_trace_context`, `extract_trace_context`, `inject_request`, `fetch`.
 - Axum middleware (`axum` feature): `.layer(autotel::axum::layer())` joins the caller's trace and records SERVER spans with a bounded `http.route`, plus `url.path`, `url.scheme`, `server.address`, `user_agent.original` and `network.protocol.version`. `.skip_routes(["/health"])` leaves probes out, `.trace_response_header()` answers with `traceparent`, and `current_trace_id()` puts the id in an error body.
-- gRPC server spans (`tonic` feature): `.layer(autotel::tonic::layer())` records `rpc.method` and `rpc.status_code` from the stable RPC conventions, with the span open for the whole stream, and `rpc.server.call.duration`.
+- gRPC server spans (`tonic` feature): `.layer(autotel::tonic::layer())` records `rpc.method` and `rpc.status_code` from the stable RPC conventions, with the span open for the whole stream, and `rpc.server.call.duration`. `autotel::tonic::client(channel)` does the same for outgoing calls, with CLIENT spans and `rpc.client.call.duration`.
 - Rolling log files through `.log_file(LogFile::new("logs"))` or `AUTOTEL_LOG_FILE_DIR`.
 - HTTP, database, messaging and workflow helpers set semconv attributes and record `http.server.request.duration`, `http.client.request.duration` and `db.client.operation.duration`. `ctx.set_query_text` records `db.query.text` with literals removed.
 - SQLx helpers (`sqlx` feature): `with_transaction`, `acquire` and `register_pool_metrics`.
-- `redact_pii` scrubs emails, card numbers, tokens and passwords from attributes, span events, logs and business events at export. `url.full` drops credentials and query values.
+- `redact_pii` scrubs emails, card numbers, tokens and passwords from attributes, span events, logs and business events at export. `url.full` drops credentials and query values. `.redact_keys(["authorization"])` adds your own key fragments.
 - Process-local tail sampling: `AdaptiveSampler::production()` keeps errors, slow traces and a baseline share of this service's spans, with `force_keep()`, `autotel.debug` baggage and `keep_when` rules. For one decision across services, use the Collector's `tail_sampling` processor.
 - Wide events (`request_logger()`), `StructuredError`, and Tokio runtime metrics (`register_runtime_metrics()`).
 

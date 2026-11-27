@@ -8,7 +8,14 @@ all-features = true
 # Fail on any RustSec vulnerability, and on crates marked unmaintained or yanked.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono, via opentelemetry-stdout behind the optional `console` feature only.
+    # Default builds don't include it. Drop this once opentelemetry-stdout moves off chrono.
+    { id = "RUSTSEC-2026-0543", reason = "only in the optional console feature" },
+    # Bundled SQLite in libsqlite3-sys, via the optional `sqlx` feature. sqlx 0.8 pins
+    # libsqlite3-sys 0.30; exposure needs a database and `-wal` file an attacker wrote.
+    { id = "RUSTSEC-2026-0459", reason = "sqlx 0.8 pins libsqlite3-sys; needs attacker-written database files" },
+]
 
 [licenses]
 # Permissive licences only: everything here is compatible with shipping autotel as MIT.

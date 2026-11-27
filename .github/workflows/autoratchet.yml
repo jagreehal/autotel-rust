@@ -1,0 +1,23 @@
+name: AutoRatchet
+
+# No function may get more complex than it is on the base branch, and new ones stay
+# under the limits (cyclomatic 10, cognitive 15).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jagreehal/autoratchet@v0.6.0
+        with:
+          path: src tests examples migrate workshop
+          override-approval: review

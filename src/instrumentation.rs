@@ -333,7 +333,8 @@ fn shared_client() -> &'static reqwest::Client {
 }
 
 /// Database CLIENT span. Records `db.client.operation.duration` labelled with system,
-/// namespace, operation and collection, plus `error.type` when the span failed.
+/// namespace, operation and collection, plus `error.type` when the span failed: call
+/// `record_error` in `work`, or use [`database_result`] to fail it on `Err`.
 pub async fn database<T, F, Fut>(
     system: &str,
     operation: &str,
@@ -371,6 +372,36 @@ where
                 started.elapsed(),
             );
             output
+        },
+    )
+    .await
+}
+
+/// [`database`] for work that returns `Result`: an `Err` fails the span and sets
+/// `error.type` on `db.client.operation.duration`.
+pub async fn database_result<T, E, F, Fut>(
+    system: &str,
+    operation: &str,
+    database_name: &str,
+    collection: &str,
+    work: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnOnce(TraceContext) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    database(
+        system,
+        operation,
+        database_name,
+        collection,
+        |context| async move {
+            let result = work(context.clone()).await;
+            if let Err(error) = &result {
+                context.record_error(error);
+            }
+            result
         },
     )
     .await

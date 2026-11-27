@@ -9,11 +9,11 @@ Set the standard variables and change no code. They beat the values in `AutotelC
 | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Turns export on. `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` override one signal. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` (default), `http/protobuf`, or `grpc` with the `grpc` feature. Anything else fails `init`. |
-| `OTEL_EXPORTER_OTLP_HEADERS` | Credentials, as `key=value,key=value`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Credentials, as `key=value,key=value`. In code: `.otlp_headers([("api-key", key)])`. |
 | `OTEL_SERVICE_NAME` | `service.name`. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Any resource attribute, such as `service.version=1.2,deployment.environment.name=prod`. |
 | `OTEL_TRACES_SAMPLER` | Head sampling, such as `parentbased_traceidratio`. |
-| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | `none` silences one signal, for backends like Jaeger that take only traces. |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | `none` silences one signal, for backends like Jaeger that take only traces. `console` prints it to stdout instead, with the `console` feature. |
 | `RUST_LOG` | Log filter for `.with_tracing_subscriber()`. |
 | `AUTOTEL_LOG_FILE_DIR` | Turns on log files in this directory, no code needed. |
 | `AUTOTEL_LOG_FILE_ROTATION` | `minutely`, `hourly`, `daily` (default) or `never`. |

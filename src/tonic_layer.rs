@@ -19,20 +19,32 @@
 //! A successful call reports `grpc-status` in trailers, after the last message, so
 //! the span stays open until the response body finishes. A streaming call's duration
 //! is the length of the stream.
+//!
+//! For outgoing calls, wrap the channel with [`client`]: each call gets a CLIENT
+//! span and carries `traceparent` and `baggage` to the server.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! let channel = tonic::transport::Channel::from_static("http://127.0.0.1:50051").connect().await?;
+//! let mut health = tonic_health::pb::health_client::HealthClient::new(autotel::tonic::client(channel));
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::{
     FutureExt,
     core::{OpenSpan, open_span},
-    extract_trace_context,
-    instruments::record_rpc_server,
+    extract_trace_context, inject_trace_context,
+    instruments::record_rpc,
     server_attrs::{connection_attributes, header_text},
 };
 use ::axum::extract::ConnectInfo;
 use ::tonic::metadata::MetadataMap;
-use http::{HeaderMap, Request, Response, StatusCode};
+use http::{HeaderMap, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
 use opentelemetry::trace::SpanKind;
 use std::{
+    any::Any,
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -129,6 +141,9 @@ struct CallSpan {
     /// `package.Service/Method`, as the client asked for it.
     method: String,
     recognised: bool,
+    client: bool,
+    /// `server.address` and `server.port` of a client call, for its metric.
+    server: Option<(String, Option<u16>)>,
 }
 
 impl CallSpan {
@@ -141,23 +156,35 @@ impl CallSpan {
             .and_then(|code| CODE_NAMES.get(code))
             .copied()
             .unwrap_or("UNKNOWN");
-        let failed = SERVER_FAULTS.contains(&code);
+        // The conventions count every non-OK code as a client error, and only the
+        // server's own faults as server errors.
+        let failed = if self.client {
+            code != 0
+        } else {
+            SERVER_FAULTS.contains(&code)
+        };
         open.context.set_attribute("rpc.status_code", status);
         if failed {
-            open.context.set_attribute("error.type", status);
-            open.context.record_error(&status);
+            open.context.fail_once(status.to_owned(), status);
         }
         // Clients choose the path, so an unknown one stays out of span names and
         // metric series and lives only as an attribute of this span.
         let mut method = self.method.as_str();
-        if code == UNIMPLEMENTED || !self.recognised {
+        if !self.client && (code == UNIMPLEMENTED || !self.recognised) {
             open.context.rename(GRPC);
             open.context.set_attribute("rpc.method_original", method);
             method = OTHER_METHOD;
         }
         // Set once, here: the SDK keeps every value a span is given for a key.
         open.context.set_attribute("rpc.method", method);
-        record_rpc_server(method, status, failed, open.elapsed());
+        record_rpc(
+            self.client,
+            method,
+            status,
+            failed,
+            self.server.as_ref(),
+            open.elapsed(),
+        );
         open.finish();
     }
 }
@@ -237,6 +264,8 @@ fn open_call<B>(request: &mut Request<B>, options: &AutotelLayer) -> CallSpan {
             open: None,
             method: String::new(),
             recognised: false,
+            client: false,
+            server: None,
         };
     }
     let method = path.trim_start_matches('/').to_owned();
@@ -254,7 +283,48 @@ fn open_call<B>(request: &mut Request<B>, options: &AutotelLayer) -> CallSpan {
         open: Some(open),
         method,
         recognised,
+        client: false,
+        server: None,
     }
+}
+
+/// Calls `inner` inside the span and keeps the span open until the response ends.
+/// `failed_call` turns an error before any response into the call's code and the
+/// error to return.
+async fn traced_call<S, ReqBody, ResBody, E>(
+    mut inner: S,
+    request: Request<ReqBody>,
+    mut span: CallSpan,
+    failed_call: fn(S::Error) -> (i32, E),
+) -> Result<Response<TracedBody<ResBody>>, E>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+{
+    let scope = span.open.as_ref().map(|open| open.scope.clone());
+    // `call` itself goes inside: a service can log or read the context there,
+    // before its future is ever polled.
+    let call = async move { inner.call(request).await };
+    let result = match scope {
+        Some(scope) => call.with_context(scope).await,
+        None => call.await,
+    };
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            let (code, error) = failed_call(error);
+            span.finish(code);
+            return Err(error);
+        }
+    };
+    // A call that ends before its first message reports its status in the headers.
+    span.recognised &= response.status().is_success();
+    if let Some(code) = status_without_body(&response) {
+        span.finish(code);
+    }
+    Ok(response.map(|inner| TracedBody {
+        inner: Box::pin(inner),
+        span,
+    }))
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AutotelMiddleware<S>
@@ -275,34 +345,187 @@ where
 
     fn call(&mut self, mut request: Request<ReqBody>) -> Self::Future {
         let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-        let mut span = open_call(&mut request, &self.options);
-        let scope = span.open.as_ref().map(|open| open.scope.clone());
-        Box::pin(async move {
-            // `call` itself goes inside: a service can log or read the context there,
-            // before its future is ever polled.
-            let call = async move { inner.call(request).await };
-            let result = match scope {
-                Some(scope) => call.with_context(scope).await,
-                None => call.await,
-            };
-            let response = match result {
-                Ok(response) => response,
-                Err(error) => {
-                    span.finish(UNKNOWN);
-                    return Err(error);
-                }
-            };
-            // A call that ends before its first message reports its status in the headers.
-            span.recognised &= response.status().is_success();
-            if let Some(code) = status_without_body(&response) {
-                span.finish(code);
+        let inner = std::mem::replace(&mut self.inner, clone);
+        let span = open_call(&mut request, &self.options);
+        Box::pin(traced_call(inner, request, span, |error| (UNKNOWN, error)))
+    }
+}
+
+/// Tower layer for a tonic client channel: one CLIENT span per call, with W3C
+/// context sent to the server.
+#[derive(Clone, Debug, Default)]
+pub struct ClientLayer {
+    server: Option<Uri>,
+}
+
+impl ClientLayer {
+    /// Same as [`ClientMiddleware::server`].
+    #[must_use]
+    pub fn server(mut self, uri: &Uri) -> Self {
+        self.server = Some(uri.clone());
+        self
+    }
+}
+
+/// Same as [`ClientLayer::default`], for `tower::ServiceBuilder`.
+#[must_use]
+pub fn client_layer() -> ClientLayer {
+    ClientLayer::default()
+}
+
+/// Wraps a channel so every call through it is traced:
+/// `GreeterClient::new(autotel::tonic::client(channel))`.
+#[must_use]
+pub fn client<S>(channel: S) -> ClientMiddleware<S> {
+    ClientMiddleware {
+        inner: channel,
+        server: None,
+    }
+}
+
+impl<S> Layer<S> for ClientLayer {
+    type Service = ClientMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ClientMiddleware {
+            inner,
+            server: self.server.clone(),
+        }
+    }
+}
+
+/// Service produced by [`ClientLayer`] and [`client`].
+#[derive(Clone, Debug)]
+pub struct ClientMiddleware<S> {
+    inner: S,
+    server: Option<Uri>,
+}
+
+impl<S> ClientMiddleware<S> {
+    /// The address the channel connects to, for `server.address` and `server.port`.
+    /// A `Channel` adds its endpoint below this layer, so the span can't see it
+    /// otherwise: `client(channel).server(endpoint.uri())`.
+    #[must_use]
+    pub fn server(mut self, uri: &Uri) -> Self {
+        self.server = Some(uri.clone());
+        self
+    }
+}
+
+/// `server.address` (IPv6 without brackets) and `server.port`, defaulting the port
+/// from the scheme.
+fn server_attributes(uri: &Uri) -> Option<(String, Option<u16>)> {
+    let host = uri.host()?.trim_start_matches('[').trim_end_matches(']');
+    let port = uri.port_u16().or(match uri.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    });
+    Some((host.to_owned(), port))
+}
+
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for ClientMiddleware<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
+    ResBody: Body + Send + 'static,
+    ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Response = Response<TracedBody<StatusBody<ResBody>>>;
+    /// tonic's client turns any channel error into a `Status`; this does it here, so
+    /// the span and the caller see the same code.
+    type Error = ::tonic::Status;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner
+            .poll_ready(cx)
+            .map_err(|error| ::tonic::Status::from_error(error.into()))
+    }
+
+    fn call(&mut self, mut request: Request<ReqBody>) -> Self::Future {
+        let clone = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, clone);
+        let method = request.uri().path().trim_start_matches('/').to_owned();
+        let open = open_span(
+            method.clone(),
+            SpanKind::Client,
+            &opentelemetry::Context::current(),
+        );
+        open.context.set_attribute("rpc.system.name", GRPC);
+        // The request carries an authority only when the client was built with an
+        // origin; otherwise use the one given to `server`.
+        let target = server_attributes(request.uri())
+            .or_else(|| self.server.as_ref().and_then(server_attributes));
+        if let Some((host, port)) = &target {
+            open.context.set_attribute("server.address", host);
+            if let Some(port) = port {
+                open.context.set_attribute("server.port", port);
             }
-            Ok(response.map(|inner| TracedBody {
-                inner: Box::pin(inner),
-                span,
+        }
+        {
+            let _scope = open.scope.clone().attach();
+            request.headers_mut().extend(inject_trace_context());
+        }
+        let span = CallSpan {
+            open: Some(open),
+            method,
+            recognised: true,
+            client: true,
+            server: target,
+        };
+        // tonic's own mapping, so the span records the code the caller gets.
+        let call = traced_call(inner, request, span, |error| {
+            let status = ::tonic::Status::from_error(error.into());
+            (i32::from(status.code()), status)
+        });
+        Box::pin(async move {
+            let response = call.await?;
+            Ok(response.map(|body| TracedBody {
+                inner: Box::pin(StatusBody(body.inner)),
+                span: body.span,
             }))
         })
+    }
+}
+
+/// A body error that is a `Status` (as every client body error is, through
+/// [`StatusBody`]) keeps its code; anything else is UNKNOWN.
+fn body_error_code<E: 'static>(error: &E) -> i32 {
+    let error: &dyn Any = error;
+    error
+        .downcast_ref::<::tonic::Status>()
+        .map_or(UNKNOWN, |status| i32::from(status.code()))
+}
+
+/// A client response body whose errors become the `Status` tonic's client would make
+/// of them, so the span records the code the caller gets.
+pub struct StatusBody<B>(Pin<Box<B>>);
+
+impl<B: Body> Body for StatusBody<B>
+where
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = B::Data;
+    type Error = ::tonic::Status;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.get_mut().0.as_mut().poll_frame(cx).map(|frame| {
+            frame.map(|result| result.map_err(|error| ::tonic::Status::from_error(error.into())))
+        })
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.0.size_hint()
     }
 }
 
@@ -312,7 +535,10 @@ pub struct TracedBody<B> {
     span: CallSpan,
 }
 
-impl<B: Body> Body for TracedBody<B> {
+impl<B: Body> Body for TracedBody<B>
+where
+    B::Error: 'static,
+{
     type Data = B::Data;
     type Error = B::Error;
 
@@ -336,7 +562,8 @@ impl<B: Body> Body for TracedBody<B> {
                     this.span.finish(grpc_status(trailers).unwrap_or(UNKNOWN));
                 }
             }
-            Poll::Ready(Some(Err(_)) | None) => this.span.finish(UNKNOWN),
+            Poll::Ready(Some(Err(error))) => this.span.finish(body_error_code(error)),
+            Poll::Ready(None) => this.span.finish(UNKNOWN),
             Poll::Pending => {}
         }
         polled

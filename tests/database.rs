@@ -1,6 +1,6 @@
 //! `db.query.text` sanitization: dialect-aware, and fail-closed on anything unbalanced.
 
-use autotel::{TraceCollector, database, sanitize_query};
+use autotel::{TraceCollector, database, database_result, sanitize_query};
 use serde_json::json;
 
 #[test]
@@ -139,5 +139,20 @@ async fn set_query_text_uses_the_span_dialect() {
     assert_eq!(
         span.attributes["db.query.text"],
         json!("SELECT id FROM users WHERE email = ?")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn database_result_fails_the_span_on_err() {
+    let collector = TraceCollector::new("database").unwrap();
+    let result: Result<(), std::io::Error> =
+        database_result("mongodb", "find", "shop", "orders", |_| async {
+            Err(std::io::Error::other("timed out"))
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        collector.expect_span("find orders").error.as_deref(),
+        Some("timed out")
     );
 }

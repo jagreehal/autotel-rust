@@ -1,6 +1,6 @@
 [package]
 name = "autotel"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Jag Reehal"]
@@ -19,7 +19,7 @@ include = ["/src/**/*.rs", "/tests/**/*.rs", "/Cargo.toml", "/README.md", "/CHAN
 all-features = true
 
 [workspace]
-members = [".", "workshop"]
+members = [".", "workshop", "migrate"]
 
 [features]
 default = []
@@ -31,6 +31,8 @@ grpc = ["opentelemetry-otlp/grpc-tonic"]
 tonic = ["dep:tonic", "dep:tower", "dep:http-body", "dep:axum"]
 ## SQLx transaction helper and pool metrics (Postgres + SQLite).
 sqlx = ["dep:sqlx"]
+## Print a signal to stdout when `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=console`.
+console = ["dep:opentelemetry-stdout"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -56,6 +58,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry", "std"] }
+opentelemetry-stdout = { version = "0.33.1", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.8.9", features = ["http2"] }
@@ -74,6 +77,11 @@ dtor = "1.0.6"
 serde_json = "1.0.154"
 tower = "0.5.3"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+# Backtraces keep file and line; full debug info roughly doubles `target`.
+# `CARGO_PROFILE_DEV_DEBUG=2` brings it back for a debugger session.
+[profile.dev]
+debug = "line-tables-only"
 
 [[example]]
 name = "axum"

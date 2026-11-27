@@ -1,9 +1,6 @@
 //! `cargo run --example tonic --features tonic`: a gRPC server and one call to it, in one trace.
-use autotel::{inject_trace_context, trace};
-use tonic::{
-    metadata::MetadataMap,
-    transport::{Channel, Server},
-};
+use autotel::trace;
+use tonic::transport::{Channel, Server};
 use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
 
 #[tokio::main]
@@ -28,11 +25,13 @@ async fn main() -> anyhow::Result<()> {
         .connect()
         .await?;
     let id = trace("check-orders", |ctx| async move {
-        let mut request = tonic::Request::new(HealthCheckRequest {
+        let request = HealthCheckRequest {
             service: "orders".into(),
-        });
-        *request.metadata_mut() = MetadataMap::from_headers(inject_trace_context());
-        let reply = HealthClient::new(channel).check(request).await?;
+        };
+        // A CLIENT span per call, with `traceparent` sent to the server.
+        let reply = HealthClient::new(autotel::tonic::client(channel))
+            .check(request)
+            .await?;
         println!("health: {:?}", reply.into_inner().status());
         Ok::<_, tonic::Status>(ctx.trace_id())
     })

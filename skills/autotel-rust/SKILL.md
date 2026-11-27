@@ -17,7 +17,7 @@ Add `autotel` as the only telemetry dependency. `init` builds the exporters, pro
 
 ```toml
 [dependencies]
-autotel = { version = "0.2", features = ["axum"] } # optional: axum, tonic, grpc, sqlx
+autotel = { version = "0.3", features = ["axum"] } # optional: axum, tonic, grpc, sqlx
 ```
 
 ```rust
@@ -37,9 +37,9 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 - Keep the guard alive. `let _ = init(...)` drops it on the spot and loses every span.
-- `OTEL_*` variables beat code: `OTEL_EXPORTER_OTLP_ENDPOINT`, `_PROTOCOL` (`http/json`, `http/protobuf`, `grpc`), `_HEADERS`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none`. `init` logs where telemetry goes. `.devtools()` sends to `autotel-devtools` on `127.0.0.1:4318` (`npx autotel-devtools`).
+- `OTEL_*` variables beat code: `OTEL_EXPORTER_OTLP_ENDPOINT`, `_PROTOCOL` (`http/json`, `http/protobuf`, `grpc`), `_HEADERS`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` (or `console` to print to stdout, `console` feature). `init` logs where telemetry goes. `.devtools()` sends to `autotel-devtools` on `127.0.0.1:4318` (`npx autotel-devtools`).
 - `.json_logs()` prints JSON lines with `trace_id`. `.with_tracing_subscriber()` installs fmt + `span_bridge()` + `log_bridge()` with a `RUST_LOG` filter. Leave it off if your app builds its own subscriber, and add `span_bridge()` and `log_bridge()` to that one.
-- Set `redact_pii: true` on the config to scrub emails, card numbers, tokens and passwords at export.
+- Set `redact_pii: true` on the config to scrub emails, card numbers, tokens and passwords at export. `.redact_keys(["authorization"])` adds your own key fragments. `.otlp_headers([("api-key", key)])` sends credentials from code.
 
 ## Which API
 
@@ -47,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
 | --- | --- |
 | Span around async work | `trace("name", \|ctx\| async move { .. }).await` |
 | Span that records `Err` as an error | `trace_result("name", \|ctx\| async move { .. }).await` |
+| Error type and cause chain on the span | `ctx.record_exception(&err)` |
+| Panics on the active span and in logs | `install_panic_hook()` after `init` |
 | Set a span kind | `trace_kind("name", SpanKind::Consumer, \|ctx\| ..)` |
 | Attributes and events | `ctx.set_attribute(k, v)`, `ctx.set_attributes(..)`, `ctx.add_event(..)` |
 | Current span from anywhere | `autotel::ctx()` or `current_context()` |
@@ -54,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
 | Logs linked to spans | `log_bridge()` layer; `JsonWithTraceIds` for stdout |
 | Incoming HTTP | `.layer(autotel::axum::layer())` or `http_server(method, route, \|ctx\| ..)` |
 | Incoming gRPC (`tonic` feature) | `Server::builder().layer(autotel::tonic::layer())`; behind axum, on the router with connect info |
+| Outgoing gRPC (`tonic` feature) | `GreeterClient::new(autotel::tonic::client(channel).server(endpoint.uri()))`, or `client_layer()` in a `ServiceBuilder` |
 | Recognised gRPC methods | `autotel::tonic::layer().methods(["package.Service/Method"])` when auth runs before routing |
 | Caller's IP | `into_make_service_with_connect_info`; `.trust_forwarded_for()` only behind a proxy |
 | Query values on spans | Redacted by default; `.raw_query()` records them as sent |
@@ -62,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 | Trace id for callers | `layer().trace_response_header()` or `current_trace_id()` in the body |
 | Outgoing HTTP with propagation | `fetch(Method::GET, url, \|req\| req)` or `http_client` + `inject_request` |
 | Propagate by hand | `inject_trace_context`, `extract_trace_context` |
-| Database call | `database(system, operation, db, collection, \|ctx\| ..)`; `ctx.set_query_text(sql)` |
+| Database call | `database(system, operation, db, collection, \|ctx\| ..)`, or `database_result` to fail the span on `Err`; `ctx.set_query_text(sql)` |
 | SQLx (`sqlx` feature) | `with_transaction`, `acquire`, `register_pool_metrics` |
 | Queues and workflows | `produce`, `consume`, `workflow`, `step` |
 | LLM calls | `gen_ai(GenAiOptions, \|ctx\| ..)`, `record_gen_ai_usage`, `GenAiMetrics` |
@@ -71,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 | Business events | `track(name, attrs)` with `.subscriber(FileSubscriber::new(path)?)` |
 | Baggage for child spans | `with_baggage(map, \|\| async { .. })`; `.baggage("app.")` copies it onto spans |
 | Keep one trace | `ctx.force_keep()` or `autotel::force_keep()` |
-| Metrics | `counter`, `histogram`, `up_down_counter`, `register_runtime_metrics()` |
+| Metrics | `counter`, `histogram`, `up_down_counter`, `gauge`, each with a `_with` variant that takes attributes; `observe_gauge`, `observe_counter`, `observe_up_down_counter` read a value at each export (refresh an atomic from a task for async sources); `create_counter` and `create_histogram` return `autotel::Counter` and `autotel::Histogram`; `register_runtime_metrics()` |
 | Change log level at runtime | `set_log_filter("debug")` |
 
 ## Spawned tasks

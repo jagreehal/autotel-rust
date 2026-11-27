@@ -14,33 +14,38 @@ use std::collections::BTreeMap;
 
 type Labels = BTreeMap<String, String>;
 
+fn labels<'a>(attributes: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> Labels {
+    attributes
+        .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+        .collect()
+}
+
+/// Labels and histogram bounds of each data point in one metric.
+fn data_points(data: &AggregatedMetrics) -> Vec<(Labels, Vec<f64>)> {
+    match data {
+        AggregatedMetrics::F64(MetricData::Histogram(h)) => h
+            .data_points()
+            .map(|dp| (labels(dp.attributes()), dp.bounds().collect()))
+            .collect(),
+        AggregatedMetrics::F64(MetricData::Gauge(g)) => g
+            .data_points()
+            .map(|dp| (labels(dp.attributes()), Vec::new()))
+            .collect(),
+        AggregatedMetrics::U64(MetricData::Gauge(g)) => g
+            .data_points()
+            .map(|dp| (labels(dp.attributes()), Vec::new()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Every exported data point: metric name → (labels, histogram bounds if any).
 fn collect(exporter: &InMemoryMetricExporter) -> Vec<(String, Labels, Vec<f64>)> {
     let mut points = Vec::new();
     for resource in exporter.get_finished_metrics().unwrap() {
-        for scope in resource.scope_metrics() {
-            for metric in scope.metrics() {
-                let name = metric.name().to_owned();
-                let mut push = |attrs: Vec<&opentelemetry::KeyValue>, bounds: Vec<f64>| {
-                    let labels = attrs
-                        .into_iter()
-                        .map(|kv| (kv.key.to_string(), kv.value.to_string()))
-                        .collect();
-                    points.push((name.clone(), labels, bounds));
-                };
-                match metric.data() {
-                    AggregatedMetrics::F64(MetricData::Histogram(h)) => {
-                        for dp in h.data_points() {
-                            push(dp.attributes().collect(), dp.bounds().collect());
-                        }
-                    }
-                    AggregatedMetrics::U64(MetricData::Gauge(g)) => {
-                        for dp in g.data_points() {
-                            push(dp.attributes().collect(), Vec::new());
-                        }
-                    }
-                    _ => {}
-                }
+        for metric in resource.scope_metrics().flat_map(|scope| scope.metrics()) {
+            for (labels, bounds) in data_points(metric.data()) {
+                points.push((metric.name().to_owned(), labels, bounds));
             }
         }
     }
@@ -101,6 +106,24 @@ async fn semconv_metrics_have_names_labels_and_buckets() {
             ..GenAiUsage::default()
         },
         1.5,
+    );
+    autotel::histogram_with(
+        "checkout.basket.size",
+        3.0,
+        "{item}",
+        &[opentelemetry::KeyValue::new("region", "eu")],
+    );
+    autotel::gauge_with(
+        "cache.hit_ratio",
+        0.9,
+        "1",
+        &[opentelemetry::KeyValue::new("region", "eu")],
+    );
+    autotel::observe_gauge(
+        "queue.depth",
+        "{item}",
+        &[opentelemetry::KeyValue::new("queue", "orders")],
+        || 7.0,
     );
 
     provider.force_flush().unwrap();
@@ -170,6 +193,10 @@ async fn semconv_metrics_have_names_labels_and_buckets() {
         ("gen_ai.token.type", "input"),
     );
     assert_eq!(tokens.2.first(), Some(&1.0));
+
+    find(&points, "checkout.basket.size", ("region", "eu"));
+    find(&points, "cache.hit_ratio", ("region", "eu"));
+    find(&points, "queue.depth", ("queue", "orders"));
 }
 
 #[test]

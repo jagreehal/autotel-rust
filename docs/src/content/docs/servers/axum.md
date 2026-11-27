@@ -4,7 +4,7 @@ description: Trace an axum server with one layer.
 ---
 
 ```toml
-autotel = { version = "0.2", features = ["axum"] }
+autotel = { version = "0.3", features = ["axum"] }
 ```
 
 ```rust
